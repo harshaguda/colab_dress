@@ -35,6 +35,7 @@ setup(
                 "pose_estimator = colab_dress.pose_estimator:main",
                 "engagement_detector = colab_dress.engagement_detector:main",
                 "set_end_effector_pose = colab_dress.set_end_effector_pose:main",
+                "end_effector_trajectory_executor = colab_dress.end_effector_trajectory_executor:main",
         ],
     },
 )

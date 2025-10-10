@@ -98,11 +98,21 @@ class ArucoDetector(Node):
         
         # Get ArUco dictionary
         aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT[self.aruco_dict_type])
-        parameters = cv2.aruco.DetectorParameters()
         
-        # Detect ArUco markers
-        detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
-        corners, ids, rejected = detector.detectMarkers(gray)
+        # Handle different OpenCV versions for ArUco detection
+        try:
+            # Try new OpenCV API (4.7+)
+            if hasattr(cv2.aruco, 'ArucoDetector'):
+                parameters = cv2.aruco.DetectorParameters()
+                detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+                corners, ids, rejected = detector.detectMarkers(gray)
+            else:
+                # Use older OpenCV API (4.0-4.6)
+                parameters = cv2.aruco.DetectorParameters_create()
+                corners, ids, rejected = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+        except Exception as e:
+            self.get_logger().error(f'ArUco detection failed: {str(e)}')
+            return
         
         # Process and publish each detected marker
         if ids is not None and len(ids) > 0:
@@ -201,7 +211,7 @@ class ArucoDetector(Node):
         Trans[0:3, 0:3] = R.T
         Trans[:-1,3] = R.T @ (-tvec)
         Trans[3, 3] = 1
-        Trans[0, 3] += 0.15 # Adjust for arucco offset from robot base
+        # Trans[0, 3] += 0.15 # Adjust for arucco offset from robot base
         np.save("translation_matrix", Trans)
         print(Trans, R, tvec)
         # print(Trans @ tvec4.T, Trans, tvec4)

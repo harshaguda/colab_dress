@@ -7,6 +7,8 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from colab_dress_interfaces.msg import ArucoMarker
 from colab_dress.get_3d_point_client import Get3DPointClient
+import sys
+
 # Define available ArUco dictionaries
 ARUCO_DICT = {
     "DICT_4X4_50": cv2.aruco.DICT_4X4_50,
@@ -174,7 +176,10 @@ class ArucoDetector(Node):
             if ids is not None and len(ids) > 0:
                 self.save_translation_matrix(rvec, response)
                 self.get_logger().info('Translation matrix saved.')
-            rclpy.shutdown()
+                cv2.destroyAllWindows()
+                self.destroy_node()
+                sys.exit(1)
+                rclpy.shutdown()
 
     def save_translation_matrix(self, rvec, response):
         """
@@ -182,7 +187,9 @@ class ArucoDetector(Node):
         
         Args:
             rvec: Rotation vector
-            tvec: Translation vector
+            response: Translation vector from Get3DPoint service
+        Returns:
+            np.ndarray: The computed transformation matrix
         """
 
         # while not_saved:

@@ -26,7 +26,7 @@ class CameraTransformPublisher(Node):
         # Parameters allowing customization at runtime
         self.declare_parameter("matrix_path", "translation_matrix.npy")
         self.declare_parameter("parent_frame", "base_link")
-        self.declare_parameter("child_frame", "external_camera_link")
+        self.declare_parameter("child_frame", "camera_link")
         self.declare_parameter("publish_rate", 10.0)
 
         matrix_path_param = self.get_parameter("matrix_path").get_parameter_value().string_value
@@ -48,7 +48,8 @@ class CameraTransformPublisher(Node):
             t_color_to_depth = np.eye(4)
             t_color_to_depth[:3, :3] = r_matrix
             transform_matrix = transform_matrix @ t_color_to_depth
-
+            print(transform_matrix)
+            transform_matrix[0:3, 3] += np.array([0.15, -0.1, 0.10])  # Adjust for camera offset from robot base
             if transform_matrix.shape != (4, 4):
                 raise ValueError(f"Matrix must be 4x4, got {transform_matrix.shape}")
 

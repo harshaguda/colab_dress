@@ -70,9 +70,10 @@ class PoseEstimator(Node):
     def color_image_callback(self, msg):
         try:
             color_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            self.estimate_pose(color_image)
         except Exception as e:
             self.get_logger().error(f'Error processing image: {str(e)}')
+        
+        self.estimate_pose(color_image)
 
         
     def draw_landmarks_on_image(self, rgb_image, detection_result):
@@ -120,15 +121,15 @@ class PoseEstimator(Node):
                 pose.x = float(x_px)
                 pose.y = float(y_px)
                 poses.poses.append(pose)
-            #     if self.translate:
-            #         response = self.get_3d_point.send_request(int(x_px), int(y_px))
-            #         pose3d.x = response.rx
-            #         pose3d.y = response.ry
-            #         pose3d.z = response.rz
-            #         poses3d.poses.append(pose3d)
+                if self.translate:
+                    response = self.get_3d_point.send_request(int(x_px), int(y_px))
+                    pose3d.position.x = response.rx
+                    pose3d.position.y = response.ry
+                    pose3d.position.z = response.rz
+                    poses3d.poses.append(pose3d)
 
-            # if self.translate:
-            #     self.pose3d_publisher.publish(poses3d)
+            if self.translate:
+                self.pose3d_publisher.publish(poses3d)
             self.pose_publisher.publish(poses)
 
         for i, vert in enumerate(shoulder_verts):

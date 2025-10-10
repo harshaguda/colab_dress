@@ -1,5 +1,8 @@
 # COLAB Dress – ROS 2 Perception & Manipulation Suite
 
+[![Deploy MkDocs](https://github.com/harshaguda/colab_dress/actions/workflows/gh-pages.yml/badge.svg)](https://github.com/harshaguda/colab_dress/actions/workflows/gh-pages.yml)
+
+
 COLAB Dress brings together perception-driven ROS 2 nodes for the collaborative dressing project. The stack fuses RealSense sensing, MediaPipe pose estimation, ArUco-based calibration, MoveIt trajectory execution, and engagement inference so that a robot can perceive a person and react to their posture in real time.
 
 ## Highlights

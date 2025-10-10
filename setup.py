@@ -1,4 +1,5 @@
 from setuptools import find_packages, setup
+from glob import glob
 
 package_name = 'colab_dress'
 
@@ -10,6 +11,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', glob('launch/*.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -36,6 +38,7 @@ setup(
                 "engagement_detector = colab_dress.engagement_detector:main",
                 "set_end_effector_pose = colab_dress.set_end_effector_pose:main",
                 "end_effector_trajectory_executor = colab_dress.end_effector_trajectory_executor:main",
+                "camera_transform_publisher = colab_dress.camera_transform_publisher:main",
         ],
     },
 )

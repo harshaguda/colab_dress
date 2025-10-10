@@ -1,0 +1,54 @@
+site_name: COLAB Dress Docs
+site_description: "Perception and manipulation stack for collaborative dressing"
+site_url: ""
+repo_url: "https://github.com/harshaguda/colab_dress"
+repo_name: "harshaguda/colab_dress"
+
+theme:
+  name: material
+  features:
+    - navigation.top
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: deep purple
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: deep purple
+
+nav:
+  - Home: index.md
+  - Setup & Installation: setup.md
+  - Pipeline Walkthrough: pipeline.md
+  - Node Reference:
+      - Nodes & Interfaces: nodes.md
+      - Calibration Workflow: calibration.md
+  - Launch Files: launches.md
+  - Development: development.md
+  - Troubleshooting: troubleshooting.md
+  - Publish Docs: github-pages.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - codehilite
+  - footnotes
+  - md_in_html
+  - pymdownx.emoji
+  - pymdownx.superfences
+  - pymdownx.tabbed
+  - toc:
+      permalink: true
+      toc_depth: 3
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/harshaguda
+    - icon: fontawesome/solid/robot
+      link: https://www.iri.upc.edu/

@@ -4,8 +4,6 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-from mediapipe import solutions
-from mediapipe.framework.formats import landmark_pb2
 import numpy as np
 import pyrealsense2 as rs
 import cv2
@@ -41,18 +39,22 @@ class PoseEstimator(Node):
         self.model_complexity = 1
         self.min_detection_confidence = 0.5
         self.min_tracking_confidence = 0.5
-        self.model_path = 'pose_landmarker.task'
+        self.model_path = 'src/colab_dress/resource/pose_landmarker_heavy.task'
 
-        self.mp_drawing = mp.solutions.drawing_utils
-
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            smooth_landmarks=self.no_smooth_landmarks,
-            static_image_mode=self.static_image_mode,
-            model_complexity=self.model_complexity,
-            min_detection_confidence=self.min_detection_confidence,
+        # Define landmark indices for the new API
+        self.WRIST = 16  # RIGHT_WRIST
+        self.ELBOW = 14  # RIGHT_ELBOW  
+        self.SHOULDER = 12  # RIGHT_SHOULDER
+        
+        # Create PoseLandmarker with new API
+        base_options = python.BaseOptions(model_asset_path=self.model_path)
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            min_pose_detection_confidence=self.min_detection_confidence,
             min_tracking_confidence=self.min_tracking_confidence
-            )
+        )
+        self.pose = vision.PoseLandmarker.create_from_options(options)
         
         self.bridge = CvBridge()
 
@@ -76,45 +78,24 @@ class PoseEstimator(Node):
         self.estimate_pose(color_image)
 
         
-    def draw_landmarks_on_image(self, rgb_image, detection_result):
-        pose_landmarks_list = detection_result.pose_landmarks
-        annotated_image = np.copy(rgb_image)
-
-        # Loop through the detected poses to visualize.
-        for idx in range(len(pose_landmarks_list)):
-            pose_landmarks = pose_landmarks_list[idx]
-            # print(pose_landmarks, idx)
-            # Draw the pose landmarks.
-            pose_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
-            pose_landmarks_proto.landmark.extend([
-            landmark_pb2.NormalizedLandmark(x=landmark.x, y=landmark.y, z=landmark.z) for landmark in pose_landmarks
-            ])
-            solutions.drawing_utils.draw_landmarks(
-            annotated_image,
-            pose_landmarks_proto,
-            solutions.pose.POSE_CONNECTIONS,
-            solutions.drawing_styles.get_default_pose_landmarks_style())
-        return annotated_image
-
     def estimate_pose(self, image):
         h, w, _ = image.shape
-        # To improve performance, optionally mark the image as not writeable to
-        # pass by reference.
-        image.flags.writeable = False
-        results = self.pose.process(image)
+        # Convert BGR to RGB as MediaPipe expects RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        
+        results = self.pose.detect(mp_image)
         shoulder_verts = []
-        required_landmarks = [
-            self.mp_pose.PoseLandmark.RIGHT_WRIST,
-            self.mp_pose.PoseLandmark.RIGHT_ELBOW,
-            self.mp_pose.PoseLandmark.RIGHT_SHOULDER,
-        ]
+        required_landmarks = [self.WRIST, self.ELBOW, self.SHOULDER]
+        
         poses = Pose2DArray()
         poses3d = PoseArray()
-        if results.pose_landmarks is not None:
-            for landmark in required_landmarks:
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks[0]  # Get first detected pose
+            for landmark_idx in required_landmarks:
                 pose = Pose2D()
                 pose3d = Pose()
-                landmark_px = results.pose_landmarks.landmark[landmark]
+                landmark_px = landmarks[landmark_idx]
                 x_px = min(math.floor(landmark_px.x * w), w - 1)
                 y_px = min(math.floor(landmark_px.y * h), h - 1)
                 shoulder_verts.append([x_px, y_px])

@@ -37,6 +37,7 @@ ARUCO_DICT = {
 class ArucoDetector(Node):
     def __init__(self, 
                  color_image_topic="/camera/camera/color/image_raw",
+                 depth_image_topic="/camera/camera/aligned_depth_to_color/image_raw",
                  color_info_topic="/camera/camera/color/camera_info",
                  aruco_dict_type="DICT_5X5_50"):
         super().__init__('aruco_detector')
@@ -51,6 +52,13 @@ class ArucoDetector(Node):
             color_image_topic,
             self.color_image_callback,
             qos_profile_sensor_data)
+
+        self.depth_image_subscription = self.create_subscription(
+            Image,
+            depth_image_topic,
+            self.depth_image_callback,
+            qos_profile_sensor_data)
+
         self.color_info_subscription = self.create_subscription(
             CameraInfo,
             color_info_topic,
@@ -68,7 +76,13 @@ class ArucoDetector(Node):
         self.matrix_coefficients = np.zeros((3, 3))
         self.coeffs = np.zeros((8,))
 
+        # Latest aligned depth frame (same pixel frame as color)
+        self._latest_depth = None
+        self._latest_depth_stamp = None
+
         self.get_logger().info(f'ArUco detector initialized with {aruco_dict_type}')
+        self.get_logger().info(f'Subscribing color: {color_image_topic}')
+        self.get_logger().info(f'Subscribing depth: {depth_image_topic}')
 
         self.get_3d_point = Get3DPointClient()
 
@@ -77,6 +91,14 @@ class ArucoDetector(Node):
             self.matrix_coefficients = np.array(msg.k).reshape(3, 3)
             self.coeffs = np.array(msg.d)
             self.get_logger().info('Camera calibration data received')
+
+    def depth_image_callback(self, msg: Image):
+        try:
+            depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            self._latest_depth = depth_image
+            self._latest_depth_stamp = msg.header.stamp
+        except Exception as e:
+            self.get_logger().error(f'Error processing depth image: {str(e)}')
 
     def color_image_callback(self, msg):
         try:
@@ -116,6 +138,43 @@ class ArucoDetector(Node):
         
         # Process and publish each detected marker
         if ids is not None and len(ids) > 0:
+            # Compute center of the first marker for visualization (in pixel coords)
+            marker_corners0 = corners[0][0]  # (4, 2)
+            center_x, center_y = np.mean(marker_corners0, axis=0).astype(int)
+
+            # Depth visualization (aligned depth -> same pixel coords as color)
+            if self._latest_depth is not None:
+                depth_vis = self.normalize_depth(self._latest_depth)
+                h, w = self._latest_depth.shape[:2]
+                center_x = int(np.clip(center_x, 0, w - 1))
+                center_y = int(np.clip(center_y, 0, h - 1))
+                cv2.circle(depth_vis, (center_x, center_y), 5, (0, 0, 255), -1)
+
+                depth_value_m = None
+                try:
+                    if self._latest_depth.dtype == np.uint16:
+                        depth_value_m = float(self._latest_depth[center_y, center_x]) / 1000.0
+                    else:
+                        dv = float(self._latest_depth[center_y, center_x])
+                        if np.isfinite(dv):
+                            depth_value_m = dv
+                except Exception:
+                    depth_value_m = None
+
+                label = f"id={int(ids[0][0])}"
+                if depth_value_m is not None:
+                    label += f" z={depth_value_m:.3f}m"
+                cv2.putText(
+                    depth_vis,
+                    label,
+                    (max(center_x + 10, 0), max(center_y - 10, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
+                )
+                cv2.imshow("Aligned Depth with Center", depth_vis)
+
             for i, marker_id in enumerate(ids):
                 # Create ArucoMarker message
                 marker_msg = ArucoMarker()
@@ -191,6 +250,25 @@ class ArucoDetector(Node):
                 sys.exit(1)
                 rclpy.shutdown()
 
+    @staticmethod
+    def normalize_depth(depth):
+        """Normalize depth image to an 8-bit color-mapped visualization."""
+        if depth.dtype == np.uint16:
+            depth_float = depth.astype(np.float32)
+            max_val = np.percentile(depth_float, 99)
+            if not np.isfinite(max_val) or max_val <= 0:
+                max_val = 1.0
+            depth_norm = np.clip(depth_float / max_val * 255.0, 0, 255).astype(np.uint8)
+        else:
+            depth_float = depth.astype(np.float32)
+            depth_float = np.nan_to_num(depth_float, nan=0.0, posinf=0.0, neginf=0.0)
+            max_val = np.percentile(depth_float, 99)
+            if not np.isfinite(max_val) or max_val <= 0:
+                max_val = 1.0
+            depth_norm = np.clip(depth_float / max_val * 255.0, 0, 255).astype(np.uint8)
+
+        return cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
+
     def save_translation_matrix(self, rvec, response):
         """
         Save the rotation and translation vectors to a file.
@@ -207,14 +285,17 @@ class ArucoDetector(Node):
         R, _ = cv2.Rodrigues(rvec)
 
         tvec = np.array([response.rx, response.ry, response.rz])
+        tvec4 = np.array([response.rx, response.ry, response.rz, 1.0])
         Trans = np.zeros((4, 4), dtype=np.float32)
         Trans[0:3, 0:3] = R.T
         Trans[:-1,3] = R.T @ (-tvec)
         Trans[3, 3] = 1
-        # Trans[0, 3] += 0.15 # Adjust for arucco offset from robot base
+        # Trans[0, 3] += 0.367 # Adjust for arucco offset from robot base
+        # Trans[1, 3] += 0.017  # Adjust for aruco offset from robot base
+        # Trans[2, 3] -= 0.04  # Adjust for camera height from robot base
         np.save("translation_matrix", Trans)
         print(Trans, R, tvec)
-        # print(Trans @ tvec4.T, Trans, tvec4)
+        print(Trans @ tvec4.T)
         
         return Trans
 

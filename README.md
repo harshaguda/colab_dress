@@ -37,6 +37,12 @@ colab_dress_ros2/
 
 - Ubuntu 22.04 with ROS 2 Humble (desktop or equivalent install)
 - Intel RealSense D435/D435i with librealsense drivers
+
+```
+sudo apt install ros-humble-librealsense2*
+sudo apt install ros-humble-realsense2-camera ros-humble-realsense2-description 
+```
+
 - Python dependencies (install once in your ROS environment):
 
 ```bash
@@ -71,7 +77,9 @@ This launch file starts the RealSense driver (with depth alignment), publishes t
 ros2 run colab_dress pose_estimator
 
 # ArUco calibration workflow
+ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true
 ros2 run colab_dress aruco_detect
+ros2 run colab_dress get_3d_point_service
 ros2 run colab_dress aruco_marker_listener
 
 # Base→camera transform broadcaster (uses translation_matrix.npy)

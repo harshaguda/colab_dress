@@ -32,6 +32,7 @@ setup(
                 "subscribe_image = colab_dress.subscribe_camera:main",
                 "aruco_detect = colab_dress.aruco_detector:main",
                 "aruco_marker_listener = colab_dress.aruco_marker_listener:main",
+                "aruco_alignment_test = colab_dress.arucomarker_alignment_test:main",
                 "get_3d_point_service = colab_dress.get_3d_point_service:main",
                 "get_3d_point_client = colab_dress.get_3d_point_client:main",
                 "pose_estimator = colab_dress.pose_estimator:main",
@@ -39,6 +40,8 @@ setup(
                 "set_end_effector_pose = colab_dress.set_end_effector_pose:main",
                 "end_effector_trajectory_executor = colab_dress.end_effector_trajectory_executor:main",
                 "camera_transform_publisher = colab_dress.camera_transform_publisher:main",
+                "dmp_node = colab_dress.dmp:main",
+                "delta_pose_publisher = colab_dress.delta_pose_publisher:main",
         ],
     },
 )

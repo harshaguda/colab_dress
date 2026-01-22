@@ -19,9 +19,10 @@ import tf2_geometry_msgs
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import CameraInfo
 from cv_bridge import CvBridge, CvBridgeError
-from geometry_msgs.msg import Pose2D, Pose, PoseArray
+from geometry_msgs.msg import Point, Pose2D, Pose, PoseArray
 from colab_dress_interfaces.msg import Pose2DArray
 from colab_dress.get_3d_point_client import Get3DPointClient
+from visualization_msgs.msg import Marker
 
 class PoseEstimator(Node):
     def __init__(self, 
@@ -67,7 +68,13 @@ class PoseEstimator(Node):
 
         self.pose_publisher = self.create_publisher(Pose2DArray, '/pose_estimator/pose_2d', 10)
         self.pose3d_publisher = self.create_publisher(PoseArray, '/pose_estimator/pose_3d', 10)
+        self.arm_points_marker_pub = self.create_publisher(Marker, '/pose_estimator/arm_points', 10)
+
+        self.declare_parameter('marker_frame_id', '')  # default: use incoming image header frame_id
+        self.declare_parameter('marker_scale', 0.05)  # 5cm spheres - easier to see in RViz
         self.get_3d_point = Get3DPointClient()
+        
+        self.get_logger().info('Publishing arm keypoints as markers on /pose_estimator/arm_points')
 
     def color_image_callback(self, msg):
         try:
@@ -75,10 +82,10 @@ class PoseEstimator(Node):
         except Exception as e:
             self.get_logger().error(f'Error processing image: {str(e)}')
         
-        self.estimate_pose(color_image)
+        self.estimate_pose(color_image, msg.header)
 
         
-    def estimate_pose(self, image):
+    def estimate_pose(self, image, header):
         h, w, _ = image.shape
         # Convert BGR to RGB as MediaPipe expects RGB
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -90,6 +97,7 @@ class PoseEstimator(Node):
         
         poses = Pose2DArray()
         poses3d = PoseArray()
+        poses3d.header = header
         if results.pose_landmarks:
             landmarks = results.pose_landmarks[0]  # Get first detected pose
             for landmark_idx in required_landmarks:
@@ -111,6 +119,7 @@ class PoseEstimator(Node):
 
             if self.translate:
                 self.pose3d_publisher.publish(poses3d)
+                self.publish_arm_points_marker(poses3d, header)
             self.pose_publisher.publish(poses)
 
         for i, vert in enumerate(shoulder_verts):
@@ -132,6 +141,33 @@ class PoseEstimator(Node):
 
         if cv2.waitKey(1) & 0xFF == 27:
             exit()
+
+    def publish_arm_points_marker(self, poses3d: PoseArray, header):
+        if not poses3d.poses:
+            return
+
+        marker = Marker()
+        # Use poses3d header (base frame) not camera header - coordinates are already in base frame
+        marker.header = poses3d.header
+        self.get_logger().info('Marker frame id: ' + marker.header.frame_id)
+
+        marker.ns = 'pose_estimator'
+        marker.id = 0
+        marker.type = Marker.SPHERE_LIST
+        marker.action = Marker.ADD
+
+        scale = float(self.get_parameter('marker_scale').get_parameter_value().double_value)
+        marker.scale.x = scale
+        marker.scale.y = scale
+        marker.scale.z = scale
+
+        marker.color.r = 1.0
+        marker.color.g = 0.2
+        marker.color.b = 0.2
+        marker.color.a = 1.0
+
+        marker.points = [Point(x=p.position.x, y=p.position.y, z=p.position.z) for p in poses3d.poses]
+        self.arm_points_marker_pub.publish(marker)
 def main():
     rclpy.init()
     pose_estimator = PoseEstimator(debug=True, translate=True)

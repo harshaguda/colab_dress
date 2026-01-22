@@ -25,7 +25,7 @@ class CameraTransformPublisher(Node):
 
         # Parameters allowing customization at runtime
         self.declare_parameter("matrix_path", "translation_matrix.npy")
-        self.declare_parameter("parent_frame", "base_link")
+        self.declare_parameter("parent_frame", "base")
         self.declare_parameter("child_frame", "camera_link")
         self.declare_parameter("publish_rate", 10.0)
 
@@ -42,14 +42,29 @@ class CameraTransformPublisher(Node):
             matrix_path = Path(matrix_path_param).expanduser().resolve()
             loaded_matrix = np.load(matrix_path)
             transform_matrix = loaded_matrix.astype(float)
-
             # Apply extra rotation (color camera -> depth camera) as in ROS1 code
             r_matrix = R.from_euler('xyz', [math.radians(135.0), math.radians(-90.0), math.radians(-45.0)]).as_matrix()
             t_color_to_depth = np.eye(4)
             t_color_to_depth[:3, :3] = r_matrix
             transform_matrix = transform_matrix @ t_color_to_depth
+
+            # x, y, z = 0.367, 0.017, -0.1
+            x, y, z = 0.473, -0.06, 0.06 # Dirty fix for new camera position, investigate why original values are not working. 
+                                         # Probably something to do with the transformations and their order.
+                            
+
+            offset = np.array([x, y, z])
+            # tvec4 = np.array([ 0.367, 0.017, -0.027, 1.0])
+            # qx, qy, qz, qw = 1.000, -0.008, 0.005, 0.014
+
+            # rot = R.from_quat([qx, qy, qz, qw]).as_matrix()
+            # T = np.eye(4)
+            # # T[:3, :3] = rot
+            # T[:3, 3] = [x, y, z]
+            # transform_matrix = T @ transform_matrix
+            # transform_matrix = np.linalg.inv(transform_matrix)
             print(transform_matrix)
-            transform_matrix[0:3, 3] += np.array([0.15, -0.1, 0.10])  # Adjust for camera offset from robot base
+            transform_matrix[0:3, 3] += offset  # Adjust for camera offset from robot base
             if transform_matrix.shape != (4, 4):
                 raise ValueError(f"Matrix must be 4x4, got {transform_matrix.shape}")
 

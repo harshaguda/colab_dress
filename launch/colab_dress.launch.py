@@ -32,31 +32,30 @@ def generate_launch_description():
     # Pose estimator node
     pose_estimator_node = Node(
         package='colab_dress',
-        executable='pose_estimator',
-        name='pose_estimator',
+        executable='simple_pose_estimator',
+        name='simple_pose_estimator',
         output='screen',
     )
 
-    # 2D to 3D point service service node
-    get_3d_point_service_node = Node(
+    dmp_node = Node(
         package='colab_dress',
-        executable='get_3d_point_service',
-        name='get_3d_point_service',
+        executable='dmp_node',
+        name='dmp_node',
         output='screen',
     )
 
-    # Engagement detector node
-    engagement_detector_node = Node(
-        package='colab_dress',
-        executable='engagement_detector',
-        name='engagement_detector',
-        output='screen',
-    )
+    # Dress node
+    # dress_node = Node(
+    #     package='colab_dress',
+    #     executable='dress_node',
+    #     name='dress_node',
+    #     output='screen',
+    # )
 
     return LaunchDescription([
         realsense_launch,
         camera_transform_publisher_node,
         pose_estimator_node,
-        get_3d_point_service_node,
-        engagement_detector_node,
+        dmp_node,
+        # dress_node,
     ])

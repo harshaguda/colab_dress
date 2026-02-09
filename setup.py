@@ -13,7 +13,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.py')),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'pyrealsense2', 'mediapipe'],
     zip_safe=True,
     maintainer='hguda',
     maintainer_email='harshavardhan.guda@gmail.com',
@@ -28,6 +28,7 @@ setup(
         'console_scripts': [
                 'talker = colab_dress.publisher_member_function:main',
                 'listener = colab_dress.subscriber_member_function:main',
+                'simple_pose_estimator = colab_dress.simple_pose_estimator:main',
                 "publish_image = colab_dress.publish_camera:main",
                 "subscribe_image = colab_dress.subscribe_camera:main",
                 "aruco_detect = colab_dress.aruco_detector:main",
@@ -42,6 +43,7 @@ setup(
                 "camera_transform_publisher = colab_dress.camera_transform_publisher:main",
                 "dmp_node = colab_dress.dmp:main",
                 "delta_pose_publisher = colab_dress.delta_pose_publisher:main",
+                "dress_node = colab_dress.dress:main",
         ],
     },
 )

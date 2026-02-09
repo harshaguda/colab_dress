@@ -2,11 +2,11 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from colab_dress_interfaces.msg import ArucoMarker
-from colab_dress.get_3d_point_client import Get3DPointClient
+import pyrealsense2 as rs2
 import sys
 
 # Define available ArUco dictionaries
@@ -47,11 +47,18 @@ class ArucoDetector(Node):
         self.bridge = CvBridge()
 
         # Subscriptions
-        self.color_image_subscription = self.create_subscription(
-            Image,
-            color_image_topic,
-            self.color_image_callback,
-            qos_profile_sensor_data)
+        if color_image_topic.endswith("/compressed"):
+            self.color_image_subscription = self.create_subscription(
+                CompressedImage,
+                color_image_topic,
+                self.color_compressed_image_callback,
+                qos_profile_sensor_data)
+        else:
+            self.color_image_subscription = self.create_subscription(
+                Image,
+                color_image_topic,
+                self.color_image_callback,
+                qos_profile_sensor_data)
 
         self.depth_image_subscription = self.create_subscription(
             Image,
@@ -84,13 +91,32 @@ class ArucoDetector(Node):
         self.get_logger().info(f'Subscribing color: {color_image_topic}')
         self.get_logger().info(f'Subscribing depth: {depth_image_topic}')
 
-        self.get_3d_point = Get3DPointClient()
+        self.intrinsics = None
 
     def camera_info_callback(self, msg):
         if self.matrix_coefficients.sum() == 0 and self.coeffs.sum() == 0:
             self.matrix_coefficients = np.array(msg.k).reshape(3, 3)
             self.coeffs = np.array(msg.d)
             self.get_logger().info('Camera calibration data received')
+
+        if self.intrinsics:
+            return
+        try:
+            self.intrinsics = rs2.intrinsics()
+            self.intrinsics.width = msg.width
+            self.intrinsics.height = msg.height
+            self.intrinsics.fx = msg.k[0]
+            self.intrinsics.fy = msg.k[4]
+            self.intrinsics.ppx = msg.k[2]
+            self.intrinsics.ppy = msg.k[5]
+            if msg.distortion_model == 'plumb_bob':
+                self.intrinsics.model = rs2.distortion.brown_conrady
+            elif msg.distortion_model == 'equidistant':
+                self.intrinsics.model = rs2.distortion.kannala_brandt4
+            self.intrinsics.coeffs = [i for i in msg.d]
+            self.get_logger().info("Camera Intrinsics Received (RS2)")
+        except Exception as e:
+            self.get_logger().error(f"Failed to parse camera info: {e}")
 
     def depth_image_callback(self, msg: Image):
         try:
@@ -107,6 +133,43 @@ class ArucoDetector(Node):
         except Exception as e:
             self.get_logger().error(f'Error processing image: {str(e)}')
 
+    def color_compressed_image_callback(self, msg: CompressedImage):
+        try:
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            color_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if color_image is None:
+                raise ValueError("Failed to decode compressed image")
+            self.detect_and_publish_aruco_markers(color_image, msg.header)
+        except Exception as e:
+            self.get_logger().error(f'Error processing compressed image: {str(e)}')
+
+    def get_3d_point_local(self, u, v):
+        if not self.intrinsics or self._latest_depth is None:
+            return None
+        
+        h, w = self._latest_depth.shape
+        if not (0 <= u < w and 0 <= v < h):
+            return None
+            
+        dist = self._latest_depth[v, u]
+        if self._latest_depth.dtype == np.uint16:
+            dist_m = dist * 0.001
+        else:
+            dist_m = float(dist)
+            
+        if dist_m <= 0:
+            return None
+        self.get_logger().info(f"Deprojecting pixel ({u}, {v}) with depth {dist_m:.3f}m")
+        p3d = rs2.rs2_deproject_pixel_to_point(self.intrinsics, [float(u), float(v)], dist_m)
+        self.get_logger().info(f"3D point in camera frame: x={p3d[0]:.3f}m, y={p3d[1]:.3f}m, z={p3d[2]:.3f}m")
+        class Response:
+            def __init__(self, x, y, z):
+                self.rx = x
+                self.ry = y
+                self.rz = z
+                
+        return Response(p3d[0], p3d[1], p3d[2])
+
     def detect_and_publish_aruco_markers(self, frame, header):
         """
         Detect ArUco markers in the image and publish each one as a separate message
@@ -114,7 +177,9 @@ class ArucoDetector(Node):
         Args:
             frame: Input image frame (BGR)
             header: ROS message header from the original image
-        """
+        """        # Initialize storage for valid detection to be used in saving
+        last_valid_rvec = None
+        last_valid_response = None
         # Convert to grayscale
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
@@ -233,7 +298,10 @@ class ArucoDetector(Node):
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                     
                     px, py = np.mean(marker_corners, axis=0).astype(int)
-                    response = self.get_3d_point.send_request(int(px), int(py))
+                    response = self.get_3d_point_local(int(px), int(py))
+                    if response is not None:
+                        last_valid_rvec = rvec
+                        last_valid_response = response
             # Optional: Draw detected markers for visualization
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
         
@@ -241,14 +309,15 @@ class ArucoDetector(Node):
             self.get_logger().info(f'Detected and published {len(ids)} ArUco marker(s)')
         cv2.imshow("ArUco Markers", frame)
         if cv2.waitKey(1) & 0xFF == ord('s'):
-            
-            if ids is not None and len(ids) > 0:
-                self.save_translation_matrix(rvec, response)
+            if last_valid_rvec is not None and last_valid_response is not None:
+                self.save_translation_matrix(last_valid_rvec, last_valid_response)
                 self.get_logger().info('Translation matrix saved.')
                 cv2.destroyAllWindows()
                 self.destroy_node()
                 sys.exit(1)
                 rclpy.shutdown()
+            else:
+                self.get_logger().warn('Cannot save: 3D point not available.')
 
     @staticmethod
     def normalize_depth(depth):
@@ -285,17 +354,20 @@ class ArucoDetector(Node):
         R, _ = cv2.Rodrigues(rvec)
 
         tvec = np.array([response.rx, response.ry, response.rz])
+        self.get_logger().info(f"tvec (camera frame): x={tvec[0]:.3f}m, y={tvec[1]:.3f}m, z={tvec[2]:.3f}m")
         tvec4 = np.array([response.rx, response.ry, response.rz, 1.0])
-        Trans = np.zeros((4, 4), dtype=np.float32)
-        Trans[0:3, 0:3] = R.T
-        Trans[:-1,3] = R.T @ (-tvec)
-        Trans[3, 3] = 1
-        # Trans[0, 3] += 0.367 # Adjust for arucco offset from robot base
-        # Trans[1, 3] += 0.017  # Adjust for aruco offset from robot base
-        # Trans[2, 3] -= 0.04  # Adjust for camera height from robot base
+        T_camera_to_marker = np.zeros((4, 4), dtype=np.float32)
+        T_camera_to_marker[0:3, 0:3] = R.T   
+        T_camera_to_marker[:-1,3] = R.T @ (-tvec)
+        T_camera_to_marker[3, 3] = 1
+        T_marker_to_base = np.eye(4)
+        T_marker_to_base[:3, 3] = np.array([0.367, 0.0119, -0.024])
+        Trans = T_marker_to_base @ T_camera_to_marker
         np.save("translation_matrix", Trans)
-        print(Trans, R, tvec)
-        print(Trans @ tvec4.T)
+        self.get_logger().info(f"Translation matrix saved to 'translation_matrix.npy'")
+
+        self.get_logger().info(f"Transformation matrix:\n{Trans}")
+        self.get_logger().info(f"Transformed tvec4: {Trans @ tvec4.T}")
         
         return Trans
 

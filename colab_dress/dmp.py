@@ -12,10 +12,11 @@ try:
     from rclpy.node import Node
     from geometry_msgs.msg import PoseArray, Pose, PointStamped, PoseStamped
     from nav_msgs.msg import Path
+    from visualization_msgs.msg import Marker
 except Exception:  # pragma: no cover - ROS 2 not available in all contexts
     rclpy = None
     Node = object
-    PoseArray = Pose = PointStamped = PoseStamped = Path = None
+    PoseArray = Pose = PointStamped = PoseStamped = Path = Marker = None
 
 class CanonicalSystem(object):
     """
@@ -504,22 +505,7 @@ class DMPNode(Node):
         self.declare_parameter("ag", 6.0)
         self.declare_parameter("av", 4.0)
         self.declare_parameter("n_dmps", 3)
-        self.declare_parameter("delta_pose_topic", "/target_pose_dmp")
-        self.declare_parameter(
-            "current_ee_topic",
-            "/NS_1/franka_robot_state_broadcaster/current_pose",
-        )
-        self.declare_parameter("publish_stride", 10)
-        self.declare_parameter("publish_chunk_size", 15)
-        self.declare_parameter("settle_position_tolerance", 0.01)
-        self.declare_parameter("settle_velocity_tolerance", 0.01)
-        self.declare_parameter("settle_count_required", 5)
         self.declare_parameter("rollout_path_topic", "/dmp/dmp_rollout_path")
-        self.declare_parameter("max_delta_norm", 0.03)
-        self.declare_parameter("max_delta_axis", 0.02)
-        self.declare_parameter("min_publish_period", 1.0)
-        self.declare_parameter("delta_reference", "initial")
-        self.declare_parameter("publish_timer_period", 0.1)
 
         n_bfs = int(self.get_parameter("n_bfs").value)
         dt = float(self.get_parameter("dt").value)
@@ -533,37 +519,7 @@ class DMPNode(Node):
         ag = float(self.get_parameter("ag").value)
         av = float(self.get_parameter("av").value)
         n_dmps = int(self.get_parameter("n_dmps").value)
-        delta_pose_topic = str(self.get_parameter("delta_pose_topic").value)
-        current_ee_topic = str(self.get_parameter("current_ee_topic").value)
-        publish_stride = int(self.get_parameter("publish_stride").value)
-        publish_chunk_size = int(self.get_parameter("publish_chunk_size").value)
-        settle_position_tolerance = float(
-            self.get_parameter("settle_position_tolerance").value
-        )
-        settle_velocity_tolerance = float(
-            self.get_parameter("settle_velocity_tolerance").value
-        )
-        settle_count_required = int(
-            self.get_parameter("settle_count_required").value
-        )
         rollout_path_topic = str(self.get_parameter("rollout_path_topic").value)
-        max_delta_norm = float(self.get_parameter("max_delta_norm").value)
-        max_delta_axis = float(self.get_parameter("max_delta_axis").value)
-        min_publish_period = float(self.get_parameter("min_publish_period").value)
-        publish_timer_period = float(self.get_parameter("publish_timer_period").value)
-        delta_reference = str(self.get_parameter("delta_reference").value).strip().lower()
-        if delta_reference not in {"current", "initial"}:
-            self.get_logger().warning(
-                "Invalid delta_reference '%s' (expected 'current' or 'initial'); defaulting to 'current'.",
-                delta_reference,
-            )
-            delta_reference = "current"
-        if delta_pose_topic == "/delta_pose" and delta_reference != "initial":
-            self.get_logger().warning(
-                "delta_reference is '%s' but controller expects /delta_pose as offset from initial pose. "
-                "Set delta_reference:=initial to avoid large pose errors.",
-                delta_reference,
-            )
 
         self.dmp = DMPDG(
             n_dmps=n_dmps,
@@ -586,31 +542,7 @@ class DMPNode(Node):
         self.last_shoulder: Optional[np.ndarray] = None
         self.goal_offset: Optional[np.ndarray] = None
         self.last_frame_id: str = ""
-
-        self.delta_pose_topic = delta_pose_topic
-        self.current_ee_topic = current_ee_topic
-        self.publish_stride = max(1, publish_stride)
-        self.publish_chunk_size = max(1, publish_chunk_size)
-        self.settle_position_tolerance = max(0.0, settle_position_tolerance)
-        self.settle_velocity_tolerance = max(0.0, settle_velocity_tolerance)
-        self.settle_count_required = max(1, settle_count_required)
         self.rollout_path_topic = rollout_path_topic
-        self.max_delta_norm = max(0.0, max_delta_norm)
-        self.max_delta_axis = max(0.0, max_delta_axis)
-        self.min_publish_period = max(0.0, min_publish_period)
-        self.delta_reference = delta_reference
-        self.publish_timer_period = max(0.01, publish_timer_period)
-
-        self.current_frame_id: str = ""
-
-        self._pending_points: list[np.ndarray] = []
-        self._next_point_index: int = 0
-        self._waiting_for_settle: bool = False
-        self._last_target: Optional[np.ndarray] = None
-        self._settle_count: int = 0
-        self._last_publish_time: Optional[float] = None
-        self._initial_ee: Optional[np.ndarray] = None
-        self._initial_frame_id: str = ""
 
         self.arm_sub = self.create_subscription(
             PoseArray, "dmp/arm_poses", self._arm_poses_cb, 10
@@ -618,24 +550,13 @@ class DMPNode(Node):
         self.shoulder_sub = self.create_subscription(
             PointStamped, "dmp/shoulder_position", self._shoulder_cb, 10
         )
-        # self.current_pose_sub = self.create_subscription(
-        #     PoseStamped, self.current_ee_topic, self._current_pose_cb, 10
-        # )
-        self.rollout_pub = self.create_publisher(PoseArray, "dmp/dmp_rollout", 10)
-        self.rollout_path_pub = self.create_publisher(Path, self.rollout_path_topic, 10)
-        self.delta_pose_pub = self.create_publisher(PoseStamped, self.delta_pose_topic, 10)
-        self._publish_timer = self.create_timer(self.publish_timer_period, self._maybe_publish_next)
 
+        self.rollout_pub = self.create_publisher(PoseArray, "/cartesian_trajectory", 10)
+        self.rollout_path_pub = self.create_publisher(Path, self.rollout_path_topic, 10)
+        self.start_pub = self.create_publisher(Marker, "/dmp/start_point", 10)
+        self.goal_pub = self.create_publisher(Marker, "/dmp/goal_point", 10)
         self.get_logger().info(
             "DMP node ready: waiting for arm_poses and shoulder_position."
-        )
-        self.get_logger().info(
-            f"Publishing delta poses to '{self.delta_pose_topic}' based on current EE "
-            f"'{self.current_ee_topic}'."
-        )
-        self.get_logger().info(
-            f"Delta reference mode: '{self.delta_reference}' "
-            f"(controller must interpret /delta_pose accordingly)."
         )
 
     def _arm_poses_cb(self, msg: PoseArray) -> None:
@@ -658,7 +579,6 @@ class DMPNode(Node):
 
         y_rollout, _, _ = self.dmp.rollout()
         self._publish_rollout(y_rollout, self.last_frame_id)
-        self._start_trajectory_publish(y_rollout, self.last_frame_id)
 
     def _shoulder_cb(self, msg: PointStamped) -> None:
         self.last_shoulder = np.array([msg.point.x, msg.point.y, msg.point.z], dtype=float)
@@ -670,63 +590,6 @@ class DMPNode(Node):
         y_rollout, _, _ = self.dmp.rollout()
         frame_id = msg.header.frame_id or self.last_frame_id
         self._publish_rollout(y_rollout, frame_id)
-        self._start_trajectory_publish(y_rollout, frame_id)
-
-    def _start_trajectory_publish(self, y_rollout: np.ndarray, frame_id: str) -> None:
-        if y_rollout.size == 0:
-            return
-
-        sampled = y_rollout[:: self.publish_stride]
-        if sampled.shape[0] > self.publish_chunk_size:
-            sampled = sampled[: self.publish_chunk_size]
-
-        self._pending_points = [pt.copy() for pt in sampled]
-        self._next_point_index = 0
-        self._waiting_for_settle = False
-        self._last_target = None
-        self._settle_count = 0
-        self.last_frame_id = frame_id
-        self._initial_ee = None
-        self._initial_frame_id = frame_id
-
-        self._maybe_publish_next()
-
-    def _maybe_publish_next(self) -> None:
-        if self._next_point_index >= len(self._pending_points):
-            return
-
-        if self._last_publish_time is not None:
-            now = self.get_clock().now().seconds_nanoseconds()
-            now_sec = float(now[0]) + float(now[1]) * 1e-9
-            if (now_sec - self._last_publish_time) < self.min_publish_period:
-                return
-        target = self._pending_points[self._next_point_index]
-        published_target = self._publish_delta_pose(target)
-        if published_target is None:
-            return
-        self._last_target = published_target
-        self._next_point_index += 1
-
-    def _publish_delta_pose(self, target_point: np.ndarray) -> Optional[np.ndarray]:
-        now = self.get_clock().now().seconds_nanoseconds()
-        now_sec = float(now[0]) + float(now[1]) * 1e-9
-        self._last_publish_time = now_sec
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.last_frame_id
-        msg.pose.position.x = float(target_point[0])
-        msg.pose.position.y = float(target_point[1])
-        msg.pose.position.z = float(target_point[2])
-        self.get_logger().info(
-            f"Publishing delta pose: "
-            f"index={self._next_point_index}, "
-            f"x={msg.pose.position.x:.4f}, "
-            f"y={msg.pose.position.y:.4f}, "
-            f"z={msg.pose.position.z:.4f}"
-        )
-        msg.pose.orientation.w = 1.0
-        self.delta_pose_pub.publish(msg)
-        return target_point
 
     def _publish_rollout(self, y_rollout: np.ndarray, frame_id: str) -> None:
         msg = PoseArray()
@@ -736,17 +599,64 @@ class DMPNode(Node):
         path_msg = Path()
         path_msg.header = msg.header
         path_msg.poses = []
+
+        # send every 10th point for visualization purposes
+        y_rollout = y_rollout[::10]
+
+        # change color of start and end points
+        start_marker = Marker()
+        start_marker.header = msg.header
+        start_marker.ns = "dmp_start"
+        start_marker.id = 0
+        start_marker.type = Marker.SPHERE
+        start_marker.action = Marker.ADD
+        start_marker.pose.position.x = float(y_rollout[0, 0])
+        start_marker.pose.position.y = float(y_rollout[0, 1])
+        start_marker.pose.position.z = float(y_rollout[0, 2])
+        start_marker.pose.orientation.w = 1.0
+        start_marker.scale.x = 0.05
+        start_marker.scale.y = 0.05
+        start_marker.scale.z = 0.05
+        start_marker.color.a = 1.0
+        start_marker.color.r = 0.0
+        start_marker.color.g = 1.0
+        start_marker.color.b = 0.0
+        self.start_pub.publish(start_marker)
+
+        goal_marker = Marker()
+        goal_marker.header = msg.header
+        goal_marker.ns = "dmp_goal"
+        goal_marker.id = 1
+        goal_marker.type = Marker.SPHERE
+        goal_marker.action = Marker.ADD
+        goal_marker.pose.position.x = float(y_rollout[-1, 0])
+        goal_marker.pose.position.y = float(y_rollout[-1, 1])
+        goal_marker.pose.position.z = float(y_rollout[-1, 2])
+        goal_marker.pose.orientation.w = 1.0
+        goal_marker.scale.x = 0.05
+        goal_marker.scale.y = 0.05
+        goal_marker.scale.z = 0.05
+        goal_marker.color.a = 1.0
+        goal_marker.color.r = 1.0
+        goal_marker.color.g = 0.0
+        goal_marker.color.b = 0.0
+        self.goal_pub.publish(goal_marker)
+
         for pt in y_rollout:
             pose = Pose()
             pose.position.x = float(pt[0])
             pose.position.y = float(pt[1])
             pose.position.z = float(pt[2])
-            pose.orientation.w = 1.0
+            pose.orientation.x = -0.7071
+            pose.orientation.y = 0.7071
+            pose.orientation.z = 0.0
+            pose.orientation.w = 0.0
             msg.poses.append(pose)
             pose_stamped = PoseStamped()
             pose_stamped.header = msg.header
             pose_stamped.pose = pose
             path_msg.poses.append(pose_stamped)
+
         self.rollout_pub.publish(msg)
         self.rollout_path_pub.publish(path_msg)
 

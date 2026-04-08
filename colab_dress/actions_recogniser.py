@@ -1,4 +1,5 @@
-from typing import List, Optional, Tuple, Union
+from collections import deque
+from typing import Deque, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -33,7 +34,7 @@ class ActionsPerf:
         model_name = get_model_list()[0]
         self.fer = EmotiEffLibRecognizer(engine="onnx", model_name=model_name, device=self.device)
         self.mtcnn = MTCNN(keep_all=False, post_process=False, min_face_size=40, device=self.device)
-        self.engagement_supported = getattr(self.fer, "classifier_weights", None) is not None and self.fer.classifier_weights.shape[1] == 2560
+        self.engagement_supported = hasattr(self.fer, "predict_engagement")
 
         self.camid = camid
         self.cap = cv2.VideoCapture(self.camid)
@@ -48,7 +49,7 @@ class ActionsPerf:
         self.i = 0
         self.action_label = ""
         self.last_confidence = 0.0
-        self.all_frames: List[np.ndarray] = []
+        self.face_frame_buffer: Deque[np.ndarray] = deque(maxlen=10)
         self.emotion = "none"
         self.engagement = "none"
 
@@ -89,15 +90,31 @@ class ActionsPerf:
         if bounding_boxes is None or probs is None:
             return [], []
 
-        bounding_boxes = bounding_boxes[probs > 0.9]
+        bounding_boxes = bounding_boxes[probs > 0.7]
         facial_images = []
+        valid_bboxes = []
         for bbox in bounding_boxes:
             box = bbox.astype(int)
             x1, y1, x2, y2 = box[0:4]
             if x1 < 0 or y1 < 0 or x2 > frame.shape[1] or y2 > frame.shape[0]:
                 continue
             facial_images.append(frame[y1:y2, x1:x2, :])
-        return facial_images, bounding_boxes
+            valid_bboxes.append(bbox)
+        return facial_images, valid_bboxes
+
+    def _infer_attention_from_face_box(self, bbox: np.ndarray, frame_shape: Tuple[int, int, int]) -> str:
+        x1, y1, x2, y2 = bbox.astype(int)[0:4]
+        face_w = max(1, x2 - x1)
+        face_h = max(1, y2 - y1)
+        face_area_ratio = (face_w * face_h) / float(frame_shape[0] * frame_shape[1])
+
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        center_x_ok = 0.2 * frame_shape[1] <= cx <= 0.8 * frame_shape[1]
+        center_y_ok = 0.2 * frame_shape[0] <= cy <= 0.85 * frame_shape[0]
+        size_ok = face_area_ratio >= 0.03
+
+        return "paying_attention" if (center_x_ok and center_y_ok and size_ok) else "not_paying_attention"
 
     def predict_engagement(self, frame: np.ndarray) -> Tuple[np.ndarray, str, str]:
         display_emotion = self.emotion
@@ -105,23 +122,41 @@ class ActionsPerf:
 
         facial_images, bboxes = self.recognize_faces(frame)
         if facial_images:
+            # Keep only the primary (largest) face for stable temporal engagement inference.
+            if len(bboxes) > 1:
+                areas = [(bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) for bbox in bboxes]
+                best_idx = int(np.argmax(areas))
+                facial_images = [facial_images[best_idx]]
+                bboxes = np.array([bboxes[best_idx]])
+
             emotions, _ = self.fer.predict_emotions(facial_images, logits=True)
             if emotions:
                 self.emotion = emotions[0]
                 display_emotion = self.emotion
 
             if self.engagement_supported:
-                self.all_frames.extend(facial_images)
-                if len(self.all_frames) >= 10:
-                    engagements, _ = self.fer.predict_engagement(
-                        self.all_frames, sliding_window_width=10
-                    )
-                    if engagements:
-                        self.engagement = engagements[0]
-                    self.all_frames = []
+                self.face_frame_buffer.append(facial_images[0])
+                model_engagement = None
+                if len(self.face_frame_buffer) == self.face_frame_buffer.maxlen:
+                    try:
+                        engagements, _ = self.fer.predict_engagement(
+                            list(self.face_frame_buffer),
+                            sliding_window_width=self.face_frame_buffer.maxlen,
+                        )
+                        if engagements:
+                            model_engagement = str(engagements[0]).lower().strip()
+                    except Exception:
+                        model_engagement = None
+
+                if model_engagement and model_engagement != "none":
+                    self.engagement = model_engagement
+                else:
+                    self.engagement = self._infer_attention_from_face_box(bboxes[0], frame.shape)
+
                 display_engagement = self.engagement
             else:
                 self.engagement = "none"
+                # self.engagement = self._infer_attention_from_face_box(bboxes[0], frame.shape)
                 display_engagement = self.engagement
 
             for bbox in bboxes:
@@ -130,6 +165,8 @@ class ActionsPerf:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
         else:
             display_emotion = "none"
+            self.engagement = "not_paying_attention"
+            display_engagement = self.engagement
 
         cv2.putText(
             frame,
@@ -194,6 +231,7 @@ class ActionsRecogniserNode(Node):
         self.last_published: Optional[str] = None
         # self.window_name = "Action Recognition + Engagement"
         # cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        
         self.timer = self.create_timer(timer_period, self.timer_callback)
         self.get_logger().info(f"Publishing actions on {topic}")
         self.get_logger().info(f"Publishing emotions on {emotions_topic}")
@@ -201,8 +239,9 @@ class ActionsRecogniserNode(Node):
         self.get_logger().info(f"Using device: {device} (camera={camera}, type={type(camera).__name__})")
 
     def timer_callback(self) -> None:
+        # cv2.waitKey(1)  # Allow OpenCV to process window events
         success, frame = self.actions.cap.read()
-        frame = cv2.rotate(frame, cv2.ROTATE_180)
+        # frame = cv2.rotate(frame, cv2.ROTATE_180)
         if not success:
             self.get_logger().warning("Could not read frame from camera")
             return
@@ -239,8 +278,8 @@ class ActionsRecogniserNode(Node):
                 f"Published action: {action_label} (confidence={confidence:.2f})"
             )
 
-        # self.emotions_publisher.publish(String(data=emotion))
-        # self.engagement_publisher.publish(String(data=engagement))
+        self.emotions_publisher.publish(String(data=emotion))
+        self.engagement_publisher.publish(String(data=engagement))
 
     def destroy_node(self):
         if hasattr(self, "actions"):

@@ -20,6 +20,7 @@ class ActionsPerf:
         camid: Union[int, str] = 0,
         model_path: str = "/home/hguda/colab_dress_ws/src/checkpoint-120",
         confidence_threshold: float = 0.9,
+        frame_rotation: int = 0,
     ) -> None:
         self.device = device
         self.device = "cuda" if torch.cuda.is_available() and device == "cuda" else "cpu"
@@ -37,8 +38,11 @@ class ActionsPerf:
         self.engagement_supported = hasattr(self.fer, "predict_engagement")
 
         self.camid = camid
+        self.frame_rotation = frame_rotation if frame_rotation in (0, 90, 180, 270) else 0
         self.cap = cv2.VideoCapture(self.camid)
-        # flip the frame upside down as the camera is mounted upside down
+        # Force deterministic orientation from OpenCV/camera backend.
+        # Some backends auto-rotate based on metadata, which can appear random across launches.
+        self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
 
         
 
@@ -50,8 +54,18 @@ class ActionsPerf:
         self.action_label = ""
         self.last_confidence = 0.0
         self.face_frame_buffer: Deque[np.ndarray] = deque(maxlen=10)
+        self.attention_history: Deque[bool] = deque(maxlen=5)
         self.emotion = "none"
         self.engagement = "none"
+
+    def normalize_frame_orientation(self, frame: np.ndarray) -> np.ndarray:
+        if self.frame_rotation == 90:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        if self.frame_rotation == 180:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        if self.frame_rotation == 270:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return frame
 
     def _ensure_video_buffer(self, frame: np.ndarray) -> None:
         if self.video is None or self.video.shape[1:] != frame.shape:
@@ -85,49 +99,94 @@ class ActionsPerf:
 
         return self.action_label, self.last_confidence
 
-    def recognize_faces(self, frame: np.ndarray) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        bounding_boxes, probs = self.mtcnn.detect(frame, landmarks=False)
-        if bounding_boxes is None or probs is None:
-            return [], []
+    def recognize_faces(self, frame: np.ndarray) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+        bounding_boxes, probs, landmarks = self.mtcnn.detect(frame, landmarks=True)
+        if bounding_boxes is None or probs is None or landmarks is None:
+            return [], [], []
 
-        bounding_boxes = bounding_boxes[probs > 0.7]
+        keep = probs > 0.7
+        bounding_boxes = bounding_boxes[keep]
+        landmarks = landmarks[keep]
         facial_images = []
         valid_bboxes = []
-        for bbox in bounding_boxes:
+        valid_landmarks = []
+        for bbox, lms in zip(bounding_boxes, landmarks):
             box = bbox.astype(int)
             x1, y1, x2, y2 = box[0:4]
             if x1 < 0 or y1 < 0 or x2 > frame.shape[1] or y2 > frame.shape[0]:
                 continue
             facial_images.append(frame[y1:y2, x1:x2, :])
             valid_bboxes.append(bbox)
-        return facial_images, valid_bboxes
+            valid_landmarks.append(lms)
+        return facial_images, valid_bboxes, valid_landmarks
 
     def _infer_attention_from_face_box(self, bbox: np.ndarray, frame_shape: Tuple[int, int, int]) -> str:
         x1, y1, x2, y2 = bbox.astype(int)[0:4]
         face_w = max(1, x2 - x1)
         face_h = max(1, y2 - y1)
         face_area_ratio = (face_w * face_h) / float(frame_shape[0] * frame_shape[1])
-
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
-        center_x_ok = 0.2 * frame_shape[1] <= cx <= 0.8 * frame_shape[1]
-        center_y_ok = 0.2 * frame_shape[0] <= cy <= 0.85 * frame_shape[0]
         size_ok = face_area_ratio >= 0.03
 
-        return "paying_attention" if (center_x_ok and center_y_ok and size_ok) else "not_paying_attention"
+        return "paying_attention" if size_ok else "not_paying_attention"
+
+    def _normalize_engagement_label(self, label: str) -> Optional[str]:
+        normalized = label.lower().strip().replace("-", "_").replace(" ", "_")
+        if normalized in {"paying_attention", "engaged", "engagement", "attentive", "focused"}:
+            return "paying_attention"
+        if normalized in {
+            "not_paying_attention",
+            "disengaged",
+            "distracted",
+            "not_engaged",
+            "unfocused",
+            "inattentive",
+        }:
+            return "not_paying_attention"
+        return None
+
+    def _infer_attention_from_landmarks(self, landmarks: np.ndarray) -> str:
+        # MTCNN: [left_eye, right_eye, nose, mouth_left, mouth_right]
+        left_eye, right_eye, nose, mouth_left, mouth_right = landmarks
+        eye_dist = float(np.linalg.norm(right_eye - left_eye))
+        if eye_dist < 8.0:
+            return "not_paying_attention"
+
+        eye_mid = (left_eye + right_eye) / 2.0
+        mouth_mid = (mouth_left + mouth_right) / 2.0
+
+        nose_center_offset = abs(float(nose[0] - eye_mid[0])) / eye_dist
+        mouth_center_offset = abs(float(mouth_mid[0] - eye_mid[0])) / eye_dist
+        eye_roll = abs(float(left_eye[1] - right_eye[1])) / eye_dist
+
+        eye_to_mouth = float(mouth_mid[1] - eye_mid[1])
+        if eye_to_mouth <= 1.0:
+            return "not_paying_attention"
+        nose_vertical_ratio = float((nose[1] - eye_mid[1]) / eye_to_mouth)
+
+        looking = (
+            nose_center_offset < 0.20
+            and mouth_center_offset < 0.22
+            and eye_roll < 0.16
+            and 0.25 <= nose_vertical_ratio <= 0.82
+        )
+        return "paying_attention" if looking else "not_paying_attention"
 
     def predict_engagement(self, frame: np.ndarray) -> Tuple[np.ndarray, str, str]:
         display_emotion = self.emotion
         display_engagement = self.engagement
 
-        facial_images, bboxes = self.recognize_faces(frame)
+        facial_images, bboxes, landmarks = self.recognize_faces(frame)
         if facial_images:
             # Keep only the primary (largest) face for stable temporal engagement inference.
             if len(bboxes) > 1:
                 areas = [(bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) for bbox in bboxes]
                 best_idx = int(np.argmax(areas))
-                facial_images = [facial_images[best_idx]]
-                bboxes = np.array([bboxes[best_idx]])
+            else:
+                best_idx = 0
+
+            facial_images = [facial_images[best_idx]]
+            bboxes = np.array([bboxes[best_idx]])
+            landmarks = np.array([landmarks[best_idx]])
 
             emotions, _ = self.fer.predict_emotions(facial_images, logits=True)
             if emotions:
@@ -144,19 +203,48 @@ class ActionsPerf:
                             sliding_window_width=self.face_frame_buffer.maxlen,
                         )
                         if engagements:
-                            model_engagement = str(engagements[0]).lower().strip()
+                            model_engagement = self._normalize_engagement_label(
+                                str(engagements[0])
+                            )
                     except Exception:
                         model_engagement = None
 
-                if model_engagement and model_engagement != "none":
+                if model_engagement is not None:
                     self.engagement = model_engagement
                 else:
-                    self.engagement = self._infer_attention_from_face_box(bboxes[0], frame.shape)
+                    landmark_attention = self._infer_attention_from_landmarks(landmarks[0])
+                    # Camera-position-independent decision: based on facial geometry.
+                    # Use face-size fallback only when landmarks indicate attention.
+                    if landmark_attention == "paying_attention":
+                        self.engagement = self._infer_attention_from_face_box(bboxes[0], frame.shape)
+                    else:
+                        self.engagement = "not_paying_attention"
+
+                self.attention_history.append(self.engagement == "paying_attention")
+                if len(self.attention_history) >= 3:
+                    votes = sum(self.attention_history)
+                    self.engagement = (
+                        "paying_attention"
+                        if votes >= (len(self.attention_history) // 2 + 1)
+                        else "not_paying_attention"
+                    )
 
                 display_engagement = self.engagement
             else:
-                self.engagement = "none"
-                # self.engagement = self._infer_attention_from_face_box(bboxes[0], frame.shape)
+                landmark_attention = self._infer_attention_from_landmarks(landmarks[0])
+                if landmark_attention == "paying_attention":
+                    self.engagement = self._infer_attention_from_face_box(bboxes[0], frame.shape)
+                else:
+                    self.engagement = "not_paying_attention"
+
+                self.attention_history.append(self.engagement == "paying_attention")
+                if len(self.attention_history) >= 3:
+                    votes = sum(self.attention_history)
+                    self.engagement = (
+                        "paying_attention"
+                        if votes >= (len(self.attention_history) // 2 + 1)
+                        else "not_paying_attention"
+                    )
                 display_engagement = self.engagement
 
             for bbox in bboxes:
@@ -166,6 +254,7 @@ class ActionsPerf:
         else:
             display_emotion = "none"
             self.engagement = "not_paying_attention"
+            self.attention_history.append(False)
             display_engagement = self.engagement
 
         cv2.putText(
@@ -193,6 +282,7 @@ class ActionsRecogniserNode(Node):
         self.declare_parameter("device", "cuda")
         self.declare_parameter("model_path", "/home/hguda/colab_dress_ws/src/checkpoint-120")
         self.declare_parameter("confidence_threshold", 0.9)
+        self.declare_parameter("frame_rotation", 0)
         self.declare_parameter("timer_period", 0.05)
         self.declare_parameter("topic", "/actions_recognised")
         self.declare_parameter("emotions_topic", "/engagement/emotions")
@@ -208,6 +298,12 @@ class ActionsRecogniserNode(Node):
         device = self.get_parameter("device").value
         model_path = self.get_parameter("model_path").value
         confidence_threshold = float(self.get_parameter("confidence_threshold").value)
+        frame_rotation = int(self.get_parameter("frame_rotation").value)
+        if frame_rotation not in (0, 90, 180, 270):
+            self.get_logger().warning(
+                f"Invalid frame_rotation={frame_rotation}; using 0. Allowed: 0, 90, 180, 270"
+            )
+            frame_rotation = 0
         timer_period = float(self.get_parameter("timer_period").value)
         topic = self.get_parameter("topic").value
         emotions_topic = self.get_parameter("emotions_topic").value
@@ -222,6 +318,7 @@ class ActionsRecogniserNode(Node):
             camid=camera,
             model_path=model_path,
             confidence_threshold=confidence_threshold,
+            frame_rotation=frame_rotation,
         )
         if not self.actions.engagement_supported:
             self.get_logger().warning(
@@ -237,14 +334,16 @@ class ActionsRecogniserNode(Node):
         self.get_logger().info(f"Publishing emotions on {emotions_topic}")
         self.get_logger().info(f"Publishing engagement on {engagement_topic}")
         self.get_logger().info(f"Using device: {device} (camera={camera}, type={type(camera).__name__})")
+        self.get_logger().info(f"Frame rotation set to {frame_rotation} degrees")
 
     def timer_callback(self) -> None:
-        # cv2.waitKey(1)  # Allow OpenCV to process window events
+        cv2.waitKey(1)  # Allow OpenCV to process window events
         success, frame = self.actions.cap.read()
-        # frame = cv2.rotate(frame, cv2.ROTATE_180)
         if not success:
             self.get_logger().warning("Could not read frame from camera")
             return
+
+        frame = self.actions.normalize_frame_orientation(frame)
 
         display_frame = frame.copy()
 

@@ -20,25 +20,16 @@ def generate_launch_description():
             'align_depth.enable': 'true',
         }.items()
     )
-    # 2D to 3D point service service node
-    get_3d_point_service_node = Node(
-        package='colab_dress',
-        executable='get_3d_point_service',
-        name='get_3d_point_service',
-        output='screen',
-    )
 
-    # Aruco marker publisher node
-    aruco_marker_publisher_node = Node(
+    camera_transform_publisher_node = Node(
         package='colab_dress',
-        executable='aruco_detect',
-        name='aruco_detect',
+        executable='camera_transform_publisher',
+        name='camera_transform_publisher',
         output='screen',
     )
 
 
     return LaunchDescription([
         realsense_launch,
-        get_3d_point_service_node,
-        aruco_marker_publisher_node,
+        camera_transform_publisher_node,
     ])

@@ -10,6 +10,7 @@ from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Header, String, Bool
 from geometry_msgs.msg import PoseArray, Pose, PointStamped
 
+import random
 
 class DressState(Enum):
     WAIT_FOR_ACTION = "wait_for_action"
@@ -30,14 +31,13 @@ class DressNode(Node):
         self.declare_parameter("pose_topic", "/pose_estimator/pose_3d")
         self.declare_parameter("trajectory_status_topic", "/dmp/trajectory_status")
         self.declare_parameter("shoulder_update_flag_topic", "/dmp/shoulder_update_enabled")
-        self.declare_parameter("enable_shoulder_updates_on_start", False)
 
         self.declare_parameter("approach_labels", ["approach"])
         self.declare_parameter("extend_labels", ["extendarm"])
         self.declare_parameter("recede_labels", ["recede"])
 
         self.declare_parameter("required_emotions", ["happy", "neutral"])
-        self.declare_parameter("required_engagement", ["paying_attention"])
+        self.declare_parameter("required_engagement", ["1"])
 
         self.declare_parameter("action_timeout", 2.0)
         self.declare_parameter("emotion_timeout", 2.0)
@@ -47,13 +47,12 @@ class DressNode(Node):
         self.declare_parameter("pose_buffer_len", 20)
         self.declare_parameter("capture_pose_samples", 20)
         self.declare_parameter("capture_pose_window_sec", 2.0)
-        self.declare_parameter("min_pose_samples", 20)
+        self.declare_parameter("min_pose_samples", 15)
         self.declare_parameter("max_pose_std", 0.1)
         self.declare_parameter("shoulder_index", 2)
         self.declare_parameter("shoulder_update_threshold", 0.1)
         self.declare_parameter("min_shoulder_update_period", 0.2)
         self.declare_parameter("frame_id_default", "base")
-        self.declare_parameter("arm_pose_z_offset", 0.05)
 
         actions_topic = self.get_parameter("actions_topic").value
         emotions_topic = self.get_parameter("emotions_topic").value
@@ -61,9 +60,6 @@ class DressNode(Node):
         pose_topic = self.get_parameter("pose_topic").value
         trajectory_status_topic = self.get_parameter("trajectory_status_topic").value
         shoulder_update_flag_topic = self.get_parameter("shoulder_update_flag_topic").value
-        enable_shoulder_updates_on_start = bool(
-            self.get_parameter("enable_shoulder_updates_on_start").value
-        )
 
         self._approach_labels = self._normalize_labels(
             self.get_parameter("approach_labels").value
@@ -101,7 +97,6 @@ class DressNode(Node):
             self.get_parameter("min_shoulder_update_period").value
         )
         self._frame_id_default = self.get_parameter("frame_id_default").value
-        self._arm_pose_z_offset = float(self.get_parameter("arm_pose_z_offset").value)
 
         self.action_sub = self.create_subscription(
             String, actions_topic, self._action_callback, 10
@@ -145,13 +140,13 @@ class DressNode(Node):
         self._trajectory_active: bool = False
         self._capture_start_time: Optional[float] = None
         self._shoulder_update_enabled: Optional[bool] = None
-        self._dressing_paused_for_status: bool = False
+        self._capture_paused_for_engagement: bool = False
+        self._dressing_paused_for_engagement: bool = False
+
+        self.dress_flag = True #random.random() < 0.5
 
         self.timer = self.create_timer(0.1, self._tick)
-        self._publish_shoulder_update_flag(enable_shoulder_updates_on_start)
-        self.get_logger().info(
-            f"Startup shoulder updates enabled: {enable_shoulder_updates_on_start}"
-        )
+        self._publish_shoulder_update_flag(True)
         self.get_logger().info("Dress FSM node ready")
 
     def _publish_shoulder_update_flag(self, enabled: bool) -> None:
@@ -161,7 +156,6 @@ class DressNode(Node):
         msg.data = bool(enabled)
         self.shoulder_flag_pub.publish(msg)
         self._shoulder_update_enabled = enabled
-        self.get_logger().info(f"Published shoulder update flag: {self._shoulder_update_enabled}")
 
     @staticmethod
     def _normalize_labels(labels) -> Set[str]:
@@ -234,6 +228,10 @@ class DressNode(Node):
         #     self._reset("recede action")
         #     return
 
+        if not self.dress_flag:
+            self.get_logger().info("Dress flag is false; skipping dressing process")
+            exit(0)
+
         action_ok = self._action_ok()
         engagement_ok = self._engagement_ok()
 
@@ -264,6 +262,22 @@ class DressNode(Node):
                 return
             if self._capture_start_time is None:
                 self._capture_start_time = time.time()
+
+            if not engagement_ok:
+                if not self._capture_paused_for_engagement:
+                    self.get_logger().warning(
+                        "Pose capture paused: waiting for desired emotion/engagement"
+                    )
+                self._capture_paused_for_engagement = True
+                self._capture_start_time = time.time()
+                return
+
+            if self._capture_paused_for_engagement:
+                self._capture_paused_for_engagement = False
+                self._capture_start_time = time.time()
+                self.get_logger().info(
+                    "Desired emotion/engagement restored; resuming pose capture"
+                )
 
             if (
                 time.time() - self._capture_start_time > self._capture_pose_window_sec
@@ -297,20 +311,20 @@ class DressNode(Node):
             return
 
         if self._state == DressState.DRESSING:
-            if not self._engagement_status_is_one():
-                if not self._dressing_paused_for_status:
-                    self._dressing_paused_for_status = True
+            if not engagement_ok:
+                if not self._dressing_paused_for_engagement:
+                    self._dressing_paused_for_engagement = True
                     self._publish_shoulder_update_flag(False)
                     self.get_logger().warning(
-                        "Dressing paused: waiting for /engagement/status == '1'"
+                        "Dressing paused: waiting for desired emotion/engagement"
                     )
                 return
 
-            if self._dressing_paused_for_status:
-                self._dressing_paused_for_status = False
+            if self._dressing_paused_for_engagement:
+                self._dressing_paused_for_engagement = False
                 self._publish_shoulder_update_flag(True)
                 self.get_logger().info(
-                    "Dressing resumed: /engagement/status is '1'"
+                    "Desired emotion/engagement restored; resuming dressing"
                 )
 
             if not self._trajectory_active:
@@ -326,8 +340,9 @@ class DressNode(Node):
         self._publish_shoulder_update_flag(new_state == DressState.DRESSING)
         if new_state != DressState.CAPTURE_POSE:
             self._capture_start_time = None
+            self._capture_paused_for_engagement = False
         if new_state != DressState.DRESSING:
-            self._dressing_paused_for_status = False
+            self._dressing_paused_for_engagement = False
         if new_state == DressState.WAIT_FOR_ACTION:
             self._pose_buffer.clear()
 
@@ -335,49 +350,19 @@ class DressNode(Node):
         self.get_logger().info(f"Resetting FSM: {reason}")
         self._recede_triggered = False
         self._pose_buffer.clear()
-        self._dressing_paused_for_status = False
+        self._capture_paused_for_engagement = False
+        self._dressing_paused_for_engagement = False
         self._state = DressState.WAIT_FOR_ACTION
 
     def _action_ok(self) -> bool:
         
-        return True
-
-        now = time.time()
-        if self._last_approach_time is None or self._last_extend_time is None:
-            return False
-        if now - self._last_approach_time > self._action_timeout:
-            return False
-        if now - self._last_extend_time > self._action_timeout:
-            return False
-        return True
+        return self.dress_flag
+        return random.random() < 0.5
 
     def _engagement_ok(self) -> bool:
-        # return True
-        now = time.time()
-        if self._last_emotion is None or self._last_emotion_time is None:
-            return False
-        if now - self._last_emotion_time > self._emotion_timeout:
-            return False
-        if self._required_emotions and self._last_emotion not in self._required_emotions:
-            return False
 
-        if not self._required_engagement:
-            return True
-        if self._last_engagement is None or self._last_engagement_time is None:
-            return False
-        if now - self._last_engagement_time > self._engagement_timeout:
-            return False
-        if self._last_engagement not in self._required_engagement:
-            return False
-        # self.get_logger().info(f"Engagement OK: Emotion={self._last_emotion}, Engagement={self._last_engagement}")
-        return True
-
-    def _engagement_status_is_one(self) -> bool:
-        if self._last_engagement is None or self._last_engagement_time is None:
-            return False
-        if time.time() - self._last_engagement_time > self._engagement_timeout:
-            return False
-        return self._last_engagement == "paying_attention" or self._last_engagement == "1"
+        return self.dress_flag
+        return random.random() < 0.5
 
     def _pose_fresh(self) -> bool:
         if self._latest_pose_time is None:
@@ -420,16 +405,14 @@ class DressNode(Node):
             pose = Pose()
             pose.position.x = float(pt[0])
             pose.position.y = float(pt[1])
-            pose.position.z = float(pt[2] + self._arm_pose_z_offset)
+            pose.position.z = float(pt[2])
             pose.orientation.w = 1.0
             msg.poses.append(pose)
 
         self.dmp_pub.publish(msg)
         self._trajectory_active = True
         self._publish_shoulder(pose_points, header)
-        self.get_logger().info(
-            f"Published initial DMP arm poses (z offset: {self._arm_pose_z_offset:.3f} m)"
-        )
+        self.get_logger().info("Published initial DMP arm poses")
 
     def _publish_shoulder(self, pose_points: np.ndarray, header: Header) -> None:
         if pose_points.shape[0] <= self._shoulder_index:
@@ -461,9 +444,8 @@ class DressNode(Node):
             and now - self._last_shoulder_publish_time < self._min_shoulder_update_period
         ):
             return
-        if self._shoulder_update_enabled:
-            self._publish_shoulder(pose_points, header)
-            self.get_logger().info("Published updated shoulder position")
+        self._publish_shoulder(pose_points, header)
+        self.get_logger().info("Published updated shoulder position")
 
 
 def main(args=None):

@@ -3,7 +3,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, Image, CameraInfo
-from geometry_msgs.msg import Pose, PoseArray
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -11,6 +11,7 @@ import time
 import os
 import pyrealsense2 as rs2  # Import pyrealsense2
 from cv_bridge import CvBridge
+from typing import Optional
 
 class SimplePoseEstimator(Node):
     def __init__(self):
@@ -19,10 +20,14 @@ class SimplePoseEstimator(Node):
         self.declare_parameter('input_topic', '/camera/camera/color/image_raw/compressed')
         self.declare_parameter('depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera/aligned_depth_to_color/camera_info')
+        self.declare_parameter('real_robot', True)
+        self.declare_parameter('franka_pose_topic', '/franka_robot_state_broadcaster/current_pose')
         
         topic_name = self.get_parameter('input_topic').get_parameter_value().string_value
         depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
         camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
+        self._real_robot = bool(self.get_parameter('real_robot').value)
+        self._franka_pose_topic = self.get_parameter('franka_pose_topic').get_parameter_value().string_value
 
         self.bridge = CvBridge()
         self.intrinsics = None
@@ -49,14 +54,22 @@ class SimplePoseEstimator(Node):
         )
 
         self.pose_3d_pub = self.create_publisher(PoseArray, '/pose_estimator/pose_3d', 10)
+        self._last_franka_pose: Optional[PoseStamped] = None
+        if self._real_robot:
+            self.franka_pose_sub = self.create_subscription(
+                PoseStamped,
+                self._franka_pose_topic,
+                self.franka_pose_callback,
+                10
+            )
         
         self.get_logger().info(f'Simple Pose Estimator started. Subscribed to: {topic_name}')
         
         # Determine valid model path
         possible_paths = [
-            'src/colab_dress/resource/pose_landmarker_full.task',
-            'share/colab_dress/resource/pose_landmarker_full.task',
-            os.path.join(os.getcwd(), 'src/colab_dress/resource/pose_landmarker_full.task')
+            # 'src/colab_dress/resource/pose_landmarker_full.task',
+            # 'share/colab_dress/resource/pose_landmarker_full.task',
+            os.path.join(os.getcwd(), 'src/colab_dress/resource/pose_landmarker_heavy.task')
         ]
         self.model_path = None
         for p in possible_paths:
@@ -85,12 +98,11 @@ class SimplePoseEstimator(Node):
                 self.get_logger().error(f"Model file not found in paths: {possible_paths}. CWD: {os.getcwd()}")
                 # Fallback to hardcoded absolute path if possible or raise error
                 # For this specific user env, I know it exists in:
-                fallback = '/home/hguda/colab_dress_ws/src/colab_dress/resource/pose_landmarker_full.task'
+                fallback = '/home/hguda/colab_dress_ws/src/colab_dress/resource/pose_landmarker_heavy.task'
                 if os.path.exists(fallback):
                     self.model_path = fallback
                 else:
-                    raise FileNotFoundError("MediaPipe Tasks API requires 'pose_landmarker_full.task'. Model not found.")
-
+                    raise FileNotFoundError("MediaPipe Tasks API requires 'pose_landmarker_heavy.task'. Model not found.")
             from mediapipe.tasks import python
             from mediapipe.tasks.python import vision
             
@@ -109,6 +121,9 @@ class SimplePoseEstimator(Node):
 
         self.prev_time = time.time()
         self.get_logger().info(f'Simple Pose Estimator started. Subscribed to: {topic_name}')
+
+    def franka_pose_callback(self, msg: PoseStamped):
+        self._last_franka_pose = msg
 
     def depth_callback(self, msg):
         try:
@@ -233,6 +248,12 @@ class SimplePoseEstimator(Node):
                                         pose_msg.poses.append(Pose())
                                 else:
                                     pose_msg.poses.append(Pose())
+
+                            if self._real_robot and self._last_franka_pose is not None:
+                                franka_pose = Pose()
+                                franka_pose.position = self._last_franka_pose.pose.position
+                                franka_pose.orientation = self._last_franka_pose.pose.orientation
+                                pose_msg.poses.insert(0, franka_pose)
                             
                             self.pose_3d_pub.publish(pose_msg)
 

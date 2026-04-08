@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import matplotlib.pyplot as plt
 try:
@@ -10,13 +12,17 @@ from typing import Optional
 try:
     import rclpy
     from rclpy.node import Node
+    from std_msgs.msg import String, Bool
     from geometry_msgs.msg import PoseArray, Pose, PointStamped, PoseStamped
     from nav_msgs.msg import Path
     from visualization_msgs.msg import Marker
 except Exception:  # pragma: no cover - ROS 2 not available in all contexts
     rclpy = None
     Node = object
-    PoseArray = Pose = PointStamped = PoseStamped = Path = Marker = None
+    class _RosMsgStub:
+        pass
+
+    PoseArray = Pose = PointStamped = PoseStamped = Path = Marker = String = Bool = _RosMsgStub
 
 class CanonicalSystem(object):
     """
@@ -506,6 +512,10 @@ class DMPNode(Node):
         self.declare_parameter("av", 4.0)
         self.declare_parameter("n_dmps", 3)
         self.declare_parameter("rollout_path_topic", "/dmp/dmp_rollout_path")
+        self.declare_parameter("publish_period", 1.0)
+        self.declare_parameter("rollout_stride", 10)
+        self.declare_parameter("trajectory_status_topic", "/dmp/trajectory_status")
+        self.declare_parameter("shoulder_update_flag_topic", "/dmp/shoulder_update_enabled")
 
         n_bfs = int(self.get_parameter("n_bfs").value)
         dt = float(self.get_parameter("dt").value)
@@ -520,6 +530,12 @@ class DMPNode(Node):
         av = float(self.get_parameter("av").value)
         n_dmps = int(self.get_parameter("n_dmps").value)
         rollout_path_topic = str(self.get_parameter("rollout_path_topic").value)
+        publish_period = float(self.get_parameter("publish_period").value)
+        rollout_stride = int(self.get_parameter("rollout_stride").value)
+        trajectory_status_topic = str(self.get_parameter("trajectory_status_topic").value)
+        shoulder_update_flag_topic = str(
+            self.get_parameter("shoulder_update_flag_topic").value
+        )
 
         self.dmp = DMPDG(
             n_dmps=n_dmps,
@@ -543,6 +559,11 @@ class DMPNode(Node):
         self.goal_offset: Optional[np.ndarray] = None
         self.last_frame_id: str = ""
         self.rollout_path_topic = rollout_path_topic
+        self.rollout_stride = max(1, rollout_stride)
+        self.shoulder_update_enabled: bool = True
+        self.active_rollout: Optional[np.ndarray] = None
+        self.active_frame_id: str = ""
+        self.rollout_index: int = 0
 
         self.arm_sub = self.create_subscription(
             PoseArray, "dmp/arm_poses", self._arm_poses_cb, 10
@@ -550,16 +571,37 @@ class DMPNode(Node):
         self.shoulder_sub = self.create_subscription(
             PointStamped, "dmp/shoulder_position", self._shoulder_cb, 10
         )
+        self.shoulder_flag_sub = self.create_subscription(
+            Bool, shoulder_update_flag_topic, self._shoulder_flag_cb, 10
+        )
 
         self.rollout_pub = self.create_publisher(PoseArray, "/cartesian_trajectory", 10)
         self.rollout_path_pub = self.create_publisher(Path, self.rollout_path_topic, 10)
         self.start_pub = self.create_publisher(Marker, "/dmp/start_point", 10)
         self.goal_pub = self.create_publisher(Marker, "/dmp/goal_point", 10)
+        self.current_pub = self.create_publisher(Marker, "/dmp/current_waypoint", 10)
+        self.status_pub = self.create_publisher(String, trajectory_status_topic, 10)
+        timer_period = publish_period if publish_period > 0.0 else 0.5
+        self.publish_timer = self.create_timer(timer_period, self._publish_next_rollout_point)
+        self._publish_status("idle")
         self.get_logger().info(
             "DMP node ready: waiting for arm_poses and shoulder_position."
         )
 
-    def _arm_poses_cb(self, msg: PoseArray) -> None:
+    def _publish_status(self, status: str) -> None:
+        msg = String()
+        msg.data = status
+        self.status_pub.publish(msg)
+
+    def _shoulder_flag_cb(self, msg) -> None:
+        prev_enabled = self.shoulder_update_enabled
+        self.shoulder_update_enabled = bool(msg.data)
+        state = "enabled" if self.shoulder_update_enabled else "disabled"
+        self.get_logger().info(f"Shoulder updates {state}.")
+        if self.active_rollout is not None and prev_enabled != self.shoulder_update_enabled:
+            self._publish_status("active" if self.shoulder_update_enabled else "paused")
+
+    def _arm_poses_cb(self, msg) -> None:
         if not msg.poses:
             self.get_logger().warning("Received empty arm_poses.")
             return
@@ -578,41 +620,89 @@ class DMPNode(Node):
             self.goal_offset = None
 
         y_rollout, _, _ = self.dmp.rollout()
-        self._publish_rollout(y_rollout, self.last_frame_id)
+        self._set_active_rollout(y_rollout, self.last_frame_id, preserve_progress=False)
 
-    def _shoulder_cb(self, msg: PointStamped) -> None:
+    def _shoulder_cb(self, msg) -> None:
         self.last_shoulder = np.array([msg.point.x, msg.point.y, msg.point.z], dtype=float)
-        if self.goal_offset is None or not self.dmp.imitate:
+        if not self.shoulder_update_enabled:
+            return
+        if not self.dmp.imitate:
+            return
+
+        # If shoulder arrives after the demo was learned, initialize the offset
+        # reference first; subsequent shoulder updates will trigger replanning.
+        if self.goal_offset is None:
+            self.goal_offset = self.dmp.goal - self.last_shoulder
+            self.get_logger().info("Initialized shoulder-goal offset reference.")
             return
 
         new_goal = self.last_shoulder + self.goal_offset
+        goal_shift = np.linalg.norm(new_goal - self.dmp.goal)
+        if goal_shift < 1e-6:
+            return
+
         self.dmp.set_goal(new_goal)
         y_rollout, _, _ = self.dmp.rollout()
         frame_id = msg.header.frame_id or self.last_frame_id
-        self._publish_rollout(y_rollout, frame_id)
+        self.get_logger().info(
+            f"Shoulder update received; replanning rollout (goal shift: {goal_shift:.4f} m)"
+        )
+        self._set_active_rollout(y_rollout, frame_id, preserve_progress=True)
 
-    def _publish_rollout(self, y_rollout: np.ndarray, frame_id: str) -> None:
+    def _set_active_rollout(
+        self, y_rollout: np.ndarray, frame_id: str, preserve_progress: bool
+    ) -> None:
+        if y_rollout.size == 0:
+            self.get_logger().warning("Received empty rollout; nothing to stream.")
+            return
+
+        y_rollout = y_rollout[:: self.rollout_stride]
+        if y_rollout.size == 0:
+            self.get_logger().warning("Downsampled rollout is empty; nothing to stream.")
+            return
+
+        prev_index = self.rollout_index
+        self.active_rollout = y_rollout
+        self.active_frame_id = frame_id
+        if preserve_progress:
+            self.rollout_index = min(prev_index, max(len(y_rollout) - 1, 0))
+            self.get_logger().info(
+                f"Shoulder moved: updated trajectory from waypoint {self.rollout_index + 1}/{len(y_rollout)}"
+            )
+            self._publish_status("updated")
+        else:
+            self.rollout_index = 0
+            self.get_logger().info(
+                f"Loaded rollout with {len(y_rollout)} points; streaming started."
+            )
+            self._publish_status("active")
+
+        self._publish_rollout_visualization(y_rollout, frame_id, self.rollout_index)
+
+    def _publish_rollout_visualization(
+        self, y_rollout: np.ndarray, frame_id: str, start_index: int = 0
+    ) -> None:
         msg = PoseArray()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = frame_id
-        msg.poses = []
         path_msg = Path()
         path_msg.header = msg.header
         path_msg.poses = []
 
-        # send every 10th point for visualization purposes
-        y_rollout = y_rollout[::10]
+        start_index = int(max(0, min(start_index, len(y_rollout) - 1)))
+        viz_rollout = y_rollout[start_index:]
 
-        # change color of start and end points
+        # start / goal markers
         start_marker = Marker()
         start_marker.header = msg.header
+        start_marker.header.frame_id = "fr3_link0"  ## Header needs to be this for RViz visualization to work , do not change.
         start_marker.ns = "dmp_start"
         start_marker.id = 0
         start_marker.type = Marker.SPHERE
         start_marker.action = Marker.ADD
-        start_marker.pose.position.x = float(y_rollout[0, 0])
-        start_marker.pose.position.y = float(y_rollout[0, 1])
-        start_marker.pose.position.z = float(y_rollout[0, 2])
+        start_marker.pose.position.x = float(viz_rollout[0, 0])
+        start_marker.pose.position.y = float(viz_rollout[0, 1])
+        start_marker.pose.position.z = float(viz_rollout[0, 2])
         start_marker.pose.orientation.w = 1.0
         start_marker.scale.x = 0.05
         start_marker.scale.y = 0.05
@@ -629,9 +719,9 @@ class DMPNode(Node):
         goal_marker.id = 1
         goal_marker.type = Marker.SPHERE
         goal_marker.action = Marker.ADD
-        goal_marker.pose.position.x = float(y_rollout[-1, 0])
-        goal_marker.pose.position.y = float(y_rollout[-1, 1])
-        goal_marker.pose.position.z = float(y_rollout[-1, 2])
+        goal_marker.pose.position.x = float(viz_rollout[-1, 0])
+        goal_marker.pose.position.y = float(viz_rollout[-1, 1])
+        goal_marker.pose.position.z = float(viz_rollout[-1, 2])
         goal_marker.pose.orientation.w = 1.0
         goal_marker.scale.x = 0.05
         goal_marker.scale.y = 0.05
@@ -642,7 +732,27 @@ class DMPNode(Node):
         goal_marker.color.b = 0.0
         self.goal_pub.publish(goal_marker)
 
-        for pt in y_rollout:
+        current_marker = Marker()
+        current_marker.header = msg.header
+        current_marker.header.frame_id = "fr3_link0"  ## Header needs to be this for RViz visualization to work , do not change.
+        current_marker.ns = "dmp_current"
+        current_marker.id = 2
+        current_marker.type = Marker.SPHERE
+        current_marker.action = Marker.ADD
+        current_marker.pose.position.x = float(viz_rollout[0, 0])
+        current_marker.pose.position.y = float(viz_rollout[0, 1])
+        current_marker.pose.position.z = float(viz_rollout[0, 2])
+        current_marker.pose.orientation.w = 1.0
+        current_marker.scale.x = 0.04
+        current_marker.scale.y = 0.04
+        current_marker.scale.z = 0.04
+        current_marker.color.a = 1.0
+        current_marker.color.r = 0.0
+        current_marker.color.g = 0.4
+        current_marker.color.b = 1.0
+        self.current_pub.publish(current_marker)
+
+        for pt in viz_rollout:
             pose = Pose()
             pose.position.x = float(pt[0])
             pose.position.y = float(pt[1])
@@ -651,14 +761,63 @@ class DMPNode(Node):
             pose.orientation.y = 0.7071
             pose.orientation.z = 0.0
             pose.orientation.w = 0.0
-            msg.poses.append(pose)
             pose_stamped = PoseStamped()
             pose_stamped.header = msg.header
             pose_stamped.pose = pose
             path_msg.poses.append(pose_stamped)
 
-        self.rollout_pub.publish(msg)
         self.rollout_path_pub.publish(path_msg)
+
+    def _publish_next_rollout_point(self) -> None:
+        if self.active_rollout is None:
+            return
+        if not self.shoulder_update_enabled:
+            return
+        if self.rollout_index >= len(self.active_rollout):
+            self.get_logger().info("Finished streaming rollout trajectory.")
+            self.active_rollout = None
+            self.rollout_index = 0
+            self._publish_status("completed")
+            return
+
+        pt = self.active_rollout[self.rollout_index]
+        msg = PoseArray()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        # msg.header.frame_id = self.active_frame_id
+        msg.header.frame_id = "fr3_link0" ## Header needs to be this for RViz visualization to work , do not change.
+        pose = Pose()
+        pose.position.x = float(pt[0])
+        pose.position.y = float(pt[1])
+        pose.position.z = float(pt[2])
+        pose.orientation.x = -0.7071
+        pose.orientation.y = 0.7071
+        pose.orientation.z = 0.0
+        pose.orientation.w = 0.0
+        msg.poses = [pose]
+        self.rollout_pub.publish(msg)
+        current_marker = Marker()
+        current_marker.header = msg.header
+        current_marker.ns = "dmp_current"
+        current_marker.id = 2
+        current_marker.type = Marker.SPHERE
+        current_marker.action = Marker.ADD
+        current_marker.pose.position.x = float(pt[0])
+        current_marker.pose.position.y = float(pt[1])
+        current_marker.pose.position.z = float(pt[2])
+        current_marker.pose.orientation.w = 1.0
+        current_marker.scale.x = 0.04
+        current_marker.scale.y = 0.04
+        current_marker.scale.z = 0.04
+        current_marker.color.a = 1.0
+        current_marker.color.r = 0.0
+        current_marker.color.g = 0.4
+        current_marker.color.b = 1.0
+        self.current_pub.publish(current_marker)
+        self.rollout_index += 1
+        if self.active_rollout is not None:
+            self._publish_rollout_visualization(
+                self.active_rollout, self.active_frame_id, self.rollout_index
+            )
 
 
 def main() -> None:

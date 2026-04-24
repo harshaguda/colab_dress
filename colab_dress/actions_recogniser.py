@@ -10,7 +10,8 @@ from transformers import AutoImageProcessor, VideoMAEForVideoClassification
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Bool, String
 
 
 class ActionsPerf:
@@ -40,11 +41,16 @@ class ActionsPerf:
         self.camid = camid
         self.frame_rotation = frame_rotation if frame_rotation in (0, 90, 180, 270) else 0
         self.cap = cv2.VideoCapture(self.camid)
-        # Force deterministic orientation from OpenCV/camera backend.
-        # Some backends auto-rotate based on metadata, which can appear random across launches.
-        self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
-
         
+        # Force deterministic orientation from OpenCV/camera backend.
+        # Disable backend auto-rotation so only `frame_rotation` controls orientation.
+        if hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+            self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+
+        cv2.waitKey(1000)  # Allow OpenCV to initialize the camera
+        success, frame = self.cap.read()
+        cv2.waitKey(1000)  # Allow camera to warm up and provide valid frames
+        success, frame = self.cap.read()
 
         if not self.cap.isOpened():
             raise RuntimeError("Could not open webcam")
@@ -57,8 +63,10 @@ class ActionsPerf:
         self.attention_history: Deque[bool] = deque(maxlen=5)
         self.emotion = "none"
         self.engagement = "none"
+        self.non_adaptive = False
 
     def normalize_frame_orientation(self, frame: np.ndarray) -> np.ndarray:
+        
         if self.frame_rotation == 90:
             return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         if self.frame_rotation == 180:
@@ -175,6 +183,11 @@ class ActionsPerf:
         display_emotion = self.emotion
         display_engagement = self.engagement
 
+        if self.non_adaptive:
+            display_emotion = "none"
+            display_engagement = "paying_attention"
+            return frame, display_emotion, display_engagement
+
         facial_images, bboxes, landmarks = self.recognize_faces(frame)
         if facial_images:
             # Keep only the primary (largest) face for stable temporal engagement inference.
@@ -287,6 +300,8 @@ class ActionsRecogniserNode(Node):
         self.declare_parameter("topic", "/actions_recognised")
         self.declare_parameter("emotions_topic", "/engagement/emotions")
         self.declare_parameter("engagement_topic", "/engagement/status")
+        self.declare_parameter("non_adaptive_flag_topic", "/non_adaptive_flag")
+        self.declare_parameter("display_image_topic", "/intention/display_frame/compressed")
 
         camera = self.get_parameter("camera").value
         if isinstance(camera, str):
@@ -308,10 +323,15 @@ class ActionsRecogniserNode(Node):
         topic = self.get_parameter("topic").value
         emotions_topic = self.get_parameter("emotions_topic").value
         engagement_topic = self.get_parameter("engagement_topic").value
+        non_adaptive_flag_topic = self.get_parameter("non_adaptive_flag_topic").value
+        display_image_topic = self.get_parameter("display_image_topic").value
 
         self.publisher_ = self.create_publisher(String, topic, 10)
         self.emotions_publisher = self.create_publisher(String, emotions_topic, 10)
         self.engagement_publisher = self.create_publisher(String, engagement_topic, 10)
+        self.display_image_publisher = self.create_publisher(
+            CompressedImage, display_image_topic, 10
+        )
 
         self.actions = ActionsPerf(
             device=device,
@@ -319,6 +339,12 @@ class ActionsRecogniserNode(Node):
             model_path=model_path,
             confidence_threshold=confidence_threshold,
             frame_rotation=frame_rotation,
+        )
+        self.non_adaptive_flag_sub = self.create_subscription(
+            Bool,
+            non_adaptive_flag_topic,
+            self._non_adaptive_flag_callback,
+            10,
         )
         if not self.actions.engagement_supported:
             self.get_logger().warning(
@@ -333,8 +359,18 @@ class ActionsRecogniserNode(Node):
         self.get_logger().info(f"Publishing actions on {topic}")
         self.get_logger().info(f"Publishing emotions on {emotions_topic}")
         self.get_logger().info(f"Publishing engagement on {engagement_topic}")
+        self.get_logger().info(f"Publishing display frames on {display_image_topic}")
+        self.get_logger().info(f"Listening non-adaptive flag on {non_adaptive_flag_topic}")
         self.get_logger().info(f"Using device: {device} (camera={camera}, type={type(camera).__name__})")
         self.get_logger().info(f"Frame rotation set to {frame_rotation} degrees")
+
+    def _non_adaptive_flag_callback(self, msg: Bool) -> None:
+        non_adaptive = bool(msg.data)
+        if self.actions.non_adaptive != non_adaptive:
+            self.actions.non_adaptive = non_adaptive
+            self.get_logger().info(
+                f"Updated non_adaptive mode from topic: {self.actions.non_adaptive}"
+            )
 
     def timer_callback(self) -> None:
         cv2.waitKey(1)  # Allow OpenCV to process window events
@@ -342,7 +378,6 @@ class ActionsRecogniserNode(Node):
         if not success:
             self.get_logger().warning("Could not read frame from camera")
             return
-
         frame = self.actions.normalize_frame_orientation(frame)
 
         display_frame = frame.copy()
@@ -365,17 +400,24 @@ class ActionsRecogniserNode(Node):
             display_frame, emotion, engagement = self.actions.predict_engagement(display_frame)
         except Exception as exc:
             self.get_logger().warning(f"Engagement inference failed, showing raw frame: {exc}")
-
+        
         cv2.imshow("Intention", display_frame)
+        ok, encoded_frame = cv2.imencode(".jpg", display_frame)
+        if ok:
+            image_msg = CompressedImage()
+            image_msg.header.stamp = self.get_clock().now().to_msg()
+            image_msg.format = "jpeg"
+            image_msg.data = encoded_frame.tobytes()
+            self.display_image_publisher.publish(image_msg)
         cv2.waitKey(1)
         if action_label:
             msg = String()
             msg.data = action_label
             self.publisher_.publish(msg)
             self.last_published = action_label
-            self.get_logger().info(
-                f"Published action: {action_label} (confidence={confidence:.2f})"
-            )
+            # self.get_logger().info(
+            #     f"Published action: {action_label} (confidence={confidence:.2f})"
+            # )
 
         self.emotions_publisher.publish(String(data=emotion))
         self.engagement_publisher.publish(String(data=engagement))

@@ -31,6 +31,7 @@ class DressNode(Node):
         self.declare_parameter("pose_topic", "/pose_estimator/pose_3d")
         self.declare_parameter("trajectory_status_topic", "/dmp/trajectory_status")
         self.declare_parameter("shoulder_update_flag_topic", "/dmp/shoulder_update_enabled")
+        self.declare_parameter("non_adaptive_flag_topic", "/non_adaptive_flag")
 
         self.declare_parameter("approach_labels", ["approach"])
         self.declare_parameter("extend_labels", ["extendarm"])
@@ -47,7 +48,7 @@ class DressNode(Node):
         self.declare_parameter("pose_buffer_len", 20)
         self.declare_parameter("capture_pose_samples", 20)
         self.declare_parameter("capture_pose_window_sec", 2.0)
-        self.declare_parameter("min_pose_samples", 15)
+        self.declare_parameter("min_pose_samples", 20)
         self.declare_parameter("max_pose_std", 0.1)
         self.declare_parameter("shoulder_index", 2)
         self.declare_parameter("shoulder_update_threshold", 0.1)
@@ -60,6 +61,7 @@ class DressNode(Node):
         pose_topic = self.get_parameter("pose_topic").value
         trajectory_status_topic = self.get_parameter("trajectory_status_topic").value
         shoulder_update_flag_topic = self.get_parameter("shoulder_update_flag_topic").value
+        non_adaptive_flag_topic = self.get_parameter("non_adaptive_flag_topic").value
 
         self._approach_labels = self._normalize_labels(
             self.get_parameter("approach_labels").value
@@ -117,6 +119,7 @@ class DressNode(Node):
         self.dmp_pub = self.create_publisher(PoseArray, "dmp/arm_poses", 10)
         self.shoulder_pub = self.create_publisher(PointStamped, "dmp/shoulder_position", 10)
         self.shoulder_flag_pub = self.create_publisher(Bool, shoulder_update_flag_topic, 10)
+        self.non_adaptive_flag_pub = self.create_publisher(Bool, non_adaptive_flag_topic, 10)
 
         self._state = DressState.WAIT_FOR_ACTION
         self._pose_buffer = deque(maxlen=max(self._pose_buffer_len, self._capture_pose_samples))
@@ -140,6 +143,7 @@ class DressNode(Node):
         self._trajectory_active: bool = False
         self._capture_start_time: Optional[float] = None
         self._shoulder_update_enabled: Optional[bool] = None
+        self._non_adaptive_flag_value: Optional[bool] = None
         self._capture_paused_for_engagement: bool = False
         self._dressing_paused_for_engagement: bool = False
 
@@ -147,6 +151,7 @@ class DressNode(Node):
 
         self.timer = self.create_timer(0.1, self._tick)
         self._publish_shoulder_update_flag(True)
+        self._publish_non_adaptive_flag(True)
         self.get_logger().info("Dress FSM node ready")
 
     def _publish_shoulder_update_flag(self, enabled: bool) -> None:
@@ -156,6 +161,14 @@ class DressNode(Node):
         msg.data = bool(enabled)
         self.shoulder_flag_pub.publish(msg)
         self._shoulder_update_enabled = enabled
+
+    def _publish_non_adaptive_flag(self, enabled: bool) -> None:
+        if self._non_adaptive_flag_value == enabled:
+            return
+        msg = Bool()
+        msg.data = bool(enabled)
+        self.non_adaptive_flag_pub.publish(msg)
+        self._non_adaptive_flag_value = enabled
 
     @staticmethod
     def _normalize_labels(labels) -> Set[str]:

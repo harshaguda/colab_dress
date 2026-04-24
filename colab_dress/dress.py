@@ -27,9 +27,11 @@ class DressNode(Node):
         self.declare_parameter("actions_topic", "/actions_recognised")
         self.declare_parameter("emotions_topic", "/engagement/emotions")
         self.declare_parameter("engagement_topic", "/engagement/status")
+        self.declare_parameter("attention_gate_topic", "/engagement/attention_gate")
         self.declare_parameter("pose_topic", "/pose_estimator/pose_3d")
         self.declare_parameter("trajectory_status_topic", "/dmp/trajectory_status")
         self.declare_parameter("shoulder_update_flag_topic", "/dmp/shoulder_update_enabled")
+        self.declare_parameter("non_adaptive_flag_topic", "/non_adaptive_flag")
         self.declare_parameter("enable_shoulder_updates_on_start", False)
 
         self.declare_parameter("approach_labels", ["approach"])
@@ -42,12 +44,13 @@ class DressNode(Node):
         self.declare_parameter("action_timeout", 2.0)
         self.declare_parameter("emotion_timeout", 2.0)
         self.declare_parameter("engagement_timeout", 2.0)
+        self.declare_parameter("attention_pause_grace_sec", 0.4)
         self.declare_parameter("pose_timeout", 1.0)
 
-        self.declare_parameter("pose_buffer_len", 20)
-        self.declare_parameter("capture_pose_samples", 20)
+        self.declare_parameter("pose_buffer_len", 10)
+        self.declare_parameter("capture_pose_samples", 10)
         self.declare_parameter("capture_pose_window_sec", 2.0)
-        self.declare_parameter("min_pose_samples", 20)
+        self.declare_parameter("min_pose_samples", 10)
         self.declare_parameter("max_pose_std", 0.1)
         self.declare_parameter("shoulder_index", 2)
         self.declare_parameter("shoulder_update_threshold", 0.1)
@@ -58,9 +61,11 @@ class DressNode(Node):
         actions_topic = self.get_parameter("actions_topic").value
         emotions_topic = self.get_parameter("emotions_topic").value
         engagement_topic = self.get_parameter("engagement_topic").value
+        attention_gate_topic = self.get_parameter("attention_gate_topic").value
         pose_topic = self.get_parameter("pose_topic").value
         trajectory_status_topic = self.get_parameter("trajectory_status_topic").value
         shoulder_update_flag_topic = self.get_parameter("shoulder_update_flag_topic").value
+        non_adaptive_flag_topic = self.get_parameter("non_adaptive_flag_topic").value
         enable_shoulder_updates_on_start = bool(
             self.get_parameter("enable_shoulder_updates_on_start").value
         )
@@ -84,6 +89,9 @@ class DressNode(Node):
         self._action_timeout = float(self.get_parameter("action_timeout").value)
         self._emotion_timeout = float(self.get_parameter("emotion_timeout").value)
         self._engagement_timeout = float(self.get_parameter("engagement_timeout").value)
+        self._attention_pause_grace_sec = float(
+            self.get_parameter("attention_pause_grace_sec").value
+        )
         self._pose_timeout = float(self.get_parameter("pose_timeout").value)
 
         self._pose_buffer_len = int(self.get_parameter("pose_buffer_len").value)
@@ -122,6 +130,8 @@ class DressNode(Node):
         self.dmp_pub = self.create_publisher(PoseArray, "dmp/arm_poses", 10)
         self.shoulder_pub = self.create_publisher(PointStamped, "dmp/shoulder_position", 10)
         self.shoulder_flag_pub = self.create_publisher(Bool, shoulder_update_flag_topic, 10)
+        self.non_adaptive_flag_pub = self.create_publisher(Bool, non_adaptive_flag_topic, 10)
+        self.attention_gate_pub = self.create_publisher(String, attention_gate_topic, 10)
 
         self._state = DressState.WAIT_FOR_ACTION
         self._pose_buffer = deque(maxlen=max(self._pose_buffer_len, self._capture_pose_samples))
@@ -139,16 +149,21 @@ class DressNode(Node):
         self._last_emotion_time: Optional[float] = None
         self._last_engagement: Optional[str] = None
         self._last_engagement_time: Optional[float] = None
+        self._attention_lost_since: Optional[float] = None
+        self._attention_gate_state: str = "1"
 
         self._last_published_shoulder: Optional[np.ndarray] = None
         self._last_shoulder_publish_time: Optional[float] = None
         self._trajectory_active: bool = False
         self._capture_start_time: Optional[float] = None
         self._shoulder_update_enabled: Optional[bool] = None
+        self._non_adaptive_flag_value: Optional[bool] = None
         self._dressing_paused_for_status: bool = False
 
         self.timer = self.create_timer(0.1, self._tick)
+        self._publish_attention_gate("1")
         self._publish_shoulder_update_flag(enable_shoulder_updates_on_start)
+        self._publish_non_adaptive_flag(False)
         self.get_logger().info(
             f"Startup shoulder updates enabled: {enable_shoulder_updates_on_start}"
         )
@@ -162,6 +177,15 @@ class DressNode(Node):
         self.shoulder_flag_pub.publish(msg)
         self._shoulder_update_enabled = enabled
         self.get_logger().info(f"Published shoulder update flag: {self._shoulder_update_enabled}")
+
+    def _publish_non_adaptive_flag(self, enabled: bool) -> None:
+        if self._non_adaptive_flag_value == enabled:
+            return
+        msg = Bool()
+        msg.data = bool(enabled)
+        self.non_adaptive_flag_pub.publish(msg)
+        self._non_adaptive_flag_value = enabled
+        self.get_logger().info(f"Published /non_adaptive_flag: {self._non_adaptive_flag_value}")
 
     @staticmethod
     def _normalize_labels(labels) -> Set[str]:
@@ -204,6 +228,7 @@ class DressNode(Node):
             return
         self._last_engagement = label
         self._last_engagement_time = time.time()
+        self._update_attention_gate_state()
 
     def _trajectory_status_callback(self, msg: String) -> None:
         status = msg.data.strip().lower()
@@ -235,7 +260,9 @@ class DressNode(Node):
         #     return
 
         action_ok = self._action_ok()
+        self.get_logger().info(f"Action OK: {action_ok}")
         engagement_ok = self._engagement_ok()
+        self._update_attention_gate_state()
 
         if self._state == DressState.WAIT_FOR_ACTION:
             if self._trajectory_active:
@@ -247,12 +274,13 @@ class DressNode(Node):
         if self._state == DressState.WAIT_FOR_ENGAGEMENT:
             if self._trajectory_active:
                 return
-            if not action_ok:
-                self._transition(DressState.WAIT_FOR_ACTION)
-                return
+            # if not action_ok:
+            #     self._transition(DressState.WAIT_FOR_ACTION)
+            #     return
             if engagement_ok:
                 self._pose_buffer.clear()
                 self._capture_start_time = time.time()
+                time.sleep(5)
                 self.get_logger().info(
                     f"Dressing initiated: collecting {self._capture_pose_samples} poses within {self._capture_pose_window_sec:.2f}s"
                 )
@@ -297,12 +325,12 @@ class DressNode(Node):
             return
 
         if self._state == DressState.DRESSING:
-            if not self._engagement_status_is_one():
+            if not self._attention_gate_is_ok():
                 if not self._dressing_paused_for_status:
                     self._dressing_paused_for_status = True
                     self._publish_shoulder_update_flag(False)
                     self.get_logger().warning(
-                        "Dressing paused: waiting for /engagement/status == '1'"
+                        "Dressing paused: waiting for /engagement/attention_gate == '1'"
                     )
                 return
 
@@ -310,12 +338,14 @@ class DressNode(Node):
                 self._dressing_paused_for_status = False
                 self._publish_shoulder_update_flag(True)
                 self.get_logger().info(
-                    "Dressing resumed: /engagement/status is '1'"
+                    "Dressing resumed: /engagement/attention_gate is '1'"
                 )
 
             if not self._trajectory_active:
                 self.get_logger().info("Dressing cycle completed. Exiting process.")
                 self._publish_shoulder_update_flag(False)
+                # wait 15 seconds to allow any final messages to be sent before exiting
+                time.sleep(15)
                 exit(0)
 
     def _transition(self, new_state: DressState) -> None:
@@ -338,17 +368,29 @@ class DressNode(Node):
         self._dressing_paused_for_status = False
         self._state = DressState.WAIT_FOR_ACTION
 
+    # def _action_ok(self) -> bool:
+        
+    #     return True
+
+    #     now = time.time()
+    #     if self._last_approach_time is None or self._last_extend_time is None:
+    #         return False
+    #     if now - self._last_approach_time > self._action_timeout:
+    #         return False
+    #     if now - self._last_extend_time > self._action_timeout:
+    #         return False
+    #     return True
+
     def _action_ok(self) -> bool:
         
-        return True
 
         now = time.time()
-        if self._last_approach_time is None or self._last_extend_time is None:
+        if self._last_approach_time is None:
             return False
         if now - self._last_approach_time > self._action_timeout:
             return False
-        if now - self._last_extend_time > self._action_timeout:
-            return False
+        # if now - self._last_extend_time > self._action_timeout:
+        #     return False
         return True
 
     def _engagement_ok(self) -> bool:
@@ -378,6 +420,38 @@ class DressNode(Node):
         if time.time() - self._last_engagement_time > self._engagement_timeout:
             return False
         return self._last_engagement == "paying_attention" or self._last_engagement == "1"
+
+    def _publish_attention_gate(self, value: str) -> None:
+        if value == self._attention_gate_state:
+            return
+        msg = String()
+        msg.data = value
+        self.attention_gate_pub.publish(msg)
+        self._attention_gate_state = value
+        if value == "1":
+            self.get_logger().info("Published /engagement/attention_gate='1' (attentive)")
+        else:
+            self.get_logger().warning("Published /engagement/attention_gate='0' (not attentive)")
+
+    def _attention_gate_is_ok(self) -> bool:
+        return self._attention_gate_state == "1"
+
+    def _update_attention_gate_state(self) -> None:
+        now = time.time()
+        currently_attentive = self._engagement_status_is_one()
+
+        if currently_attentive:
+            self._attention_lost_since = None
+            self._publish_attention_gate("1")
+            return
+
+        if self._attention_lost_since is None:
+            self._attention_lost_since = now
+
+        if now - self._attention_lost_since >= self._attention_pause_grace_sec:
+            self._publish_attention_gate("0")
+        else:
+            self._publish_attention_gate("1")
 
     def _pose_fresh(self) -> bool:
         if self._latest_pose_time is None:

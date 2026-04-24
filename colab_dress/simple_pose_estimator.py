@@ -22,12 +22,14 @@ class SimplePoseEstimator(Node):
         self.declare_parameter('camera_info_topic', '/camera/camera/aligned_depth_to_color/camera_info')
         self.declare_parameter('real_robot', True)
         self.declare_parameter('franka_pose_topic', '/franka_robot_state_broadcaster/current_pose')
+        self.declare_parameter('display_image_topic', '/pose_estimator/display_image/compressed')
         
         topic_name = self.get_parameter('input_topic').get_parameter_value().string_value
         depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
         camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
         self._real_robot = bool(self.get_parameter('real_robot').value)
         self._franka_pose_topic = self.get_parameter('franka_pose_topic').get_parameter_value().string_value
+        self._display_image_topic = self.get_parameter('display_image_topic').get_parameter_value().string_value
 
         self.bridge = CvBridge()
         self.intrinsics = None
@@ -54,6 +56,7 @@ class SimplePoseEstimator(Node):
         )
 
         self.pose_3d_pub = self.create_publisher(PoseArray, '/pose_estimator/pose_3d', 10)
+        self.display_image_pub = self.create_publisher(CompressedImage, self._display_image_topic, 10)
         self._last_franka_pose: Optional[PoseStamped] = None
         if self._real_robot:
             self.franka_pose_sub = self.create_subscription(
@@ -64,6 +67,7 @@ class SimplePoseEstimator(Node):
             )
         
         self.get_logger().info(f'Simple Pose Estimator started. Subscribed to: {topic_name}')
+        self.get_logger().info(f'Publishing display image on: {self._display_image_topic}')
         
         # Determine valid model path
         possible_paths = [
@@ -287,6 +291,13 @@ class SimplePoseEstimator(Node):
             )
             
             cv2.imshow('Simple Pose Estimator', image)
+            ok, encoded_image = cv2.imencode('.jpg', image)
+            if ok:
+                image_msg = CompressedImage()
+                image_msg.header.stamp = self.get_clock().now().to_msg()
+                image_msg.format = 'jpeg'
+                image_msg.data = encoded_image.tobytes()
+                self.display_image_pub.publish(image_msg)
             key = cv2.waitKey(1)
             if key == 27: # ESC
                 rclpy.shutdown()
